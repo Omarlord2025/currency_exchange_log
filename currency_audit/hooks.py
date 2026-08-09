@@ -82,8 +82,7 @@ app_license = "mit"
 # Installation
 # ------------
 
-# before_install = "currency_audit.install.before_install"
-# after_install = "currency_audit.install.after_install"
+after_install = "currency_audit.install.after_install"
 
 # Uninstallation
 # ------------
@@ -137,13 +136,11 @@ app_license = "mit"
 # ---------------
 # Hook on document methods and events
 
-# doc_events = {
-# 	"*": {
-# 		"on_update": "method",
-# 		"on_cancel": "method",
-# 		"on_trash": "method"
-# 	}
-# }
+doc_events = {
+	"Currency Exchange": {
+		"on_update": "currency_audit.events.currency_exchange.on_update",
+	},
+}
 
 # Scheduled Tasks
 # ---------------
