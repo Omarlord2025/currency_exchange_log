@@ -11,9 +11,10 @@ against every transaction doctype that snapshots a conversion rate:
 """
 
 import time
+from datetime import datetime, time as time_of_day
 
 import frappe
-from frappe.utils import add_to_date, flt, getdate, now_datetime
+from frappe.utils import add_to_date, flt, get_datetime, get_time, getdate, now_datetime
 
 STANDARD_DOCTYPES = (
 	"Sales Invoice",
@@ -142,9 +143,9 @@ def _companies_with_currency(currency):
 
 
 def _rate_windows(log):
-	"""The posting_date period each of this log's old_rate/new_rate was actually
-	active for, based on this log's own Currency Exchange record's chronological
-	history of entries — the mechanism behind match_confidence (Confirmed/Possible).
+	"""The exact period each of this log's old_rate/new_rate was actually active
+	for, based on this log's own Currency Exchange record's chronological history
+	of entries — the mechanism behind match_confidence (Confirmed/Possible).
 
 	Point 10/13: a rate value can recur (50 -> 52 -> 50 -> 52) without a matching
 	transaction's currency+rate alone being enough to say which occurrence it
@@ -152,13 +153,19 @@ def _rate_windows(log):
 	not date match) — it only labels confidence, so an ambiguous case is still shown,
 	just flagged for a second look instead of presented with false certainty.
 
+	Uses full changed_on timestamps, not dates — changed_on always has real
+	second-level precision (it's stamped by the hook/backfill at the moment of the
+	edit), and comparing at that precision instead of truncating to a day is what
+	makes _confidence actually decisive for same-day edits, rather than treating
+	the whole day as shared/ambiguous territory.
+
 	Args:
 		log (Document): the Currency Exchange Log entry being matched.
 
 	Returns:
 		dict: {"Old Rate": (start, end), "New Rate": (start, end)}, each a
-			(date | None, date | None) tuple — a window bound is None when open-ended
-			(no entry before/after this one for the same Currency Exchange record).
+			(datetime | None, datetime | None) tuple — a window bound is None when
+			open-ended (no entry before/after this one for the same record).
 	"""
 	siblings = frappe.get_all(
 		"Currency Exchange Log",
@@ -167,7 +174,7 @@ def _rate_windows(log):
 		order_by="changed_on asc",
 	)
 	names = [s.name for s in siblings]
-	dates = [getdate(s.changed_on) for s in siblings]
+	timestamps = [get_datetime(s.changed_on) for s in siblings]
 
 	if log.name not in names:
 		# Not yet visible in this ordering (e.g. mid-insert in a test) — no basis to
@@ -176,29 +183,53 @@ def _rate_windows(log):
 
 	idx = names.index(log.name)
 	return {
-		"Old Rate": (dates[idx - 1] if idx > 0 else None, dates[idx]),
-		"New Rate": (dates[idx], dates[idx + 1] if idx + 1 < len(dates) else None),
+		"Old Rate": (timestamps[idx - 1] if idx > 0 else None, timestamps[idx]),
+		"New Rate": (timestamps[idx], timestamps[idx + 1] if idx + 1 < len(timestamps) else None),
 	}
 
 
-def _confidence(posting_date, window):
-	"""Confirmed if posting_date falls within [start, end] (inclusive both ends —
-	changed_on only has day precision here, so the transition day itself can't be
-	split between the old and new rate), else Possible.
+def _posting_datetime(posting_date, posting_time=None):
+	"""Combine a matched document's posting_date (and posting_time, for the doctypes
+	that have one) into a full timestamp for accurate window comparison.
+
+	Sales Invoice, Purchase Invoice, POS Invoice, Purchase Receipt, and Delivery
+	Note all carry a posting_time alongside posting_date — real precision, used
+	here. Payment Entry and Journal Entry have no such field in ERPNext at all, so
+	for those this falls back to midnight: the best available precision for those
+	two doctypes is, honestly, day-level — there's no time-of-day data to combine.
 
 	Args:
-		posting_date (date | None): the matched document's posting date.
-		window (tuple[date | None, date | None]): this rate's active period.
+		posting_date (date | None): the document's posting date.
+		posting_time (time | timedelta | str | None): the document's posting time,
+			where the doctype has one.
+
+	Returns:
+		datetime | None: the combined timestamp, or None if posting_date is missing.
+	"""
+	if posting_date is None:
+		return None
+	return datetime.combine(getdate(posting_date), get_time(posting_time) if posting_time else time_of_day.min)
+
+
+def _confidence(posting_datetime, window):
+	"""Confirmed if posting_datetime falls within [start, end] (inclusive both
+	ends, as a safety margin for the rare case of an exact-instant match), else
+	Possible.
+
+	Args:
+		posting_datetime (datetime | None): the matched document's full timestamp —
+			see _posting_datetime.
+		window (tuple[datetime | None, datetime | None]): this rate's active period.
 
 	Returns:
 		str: "Confirmed" or "Possible".
 	"""
 	start, end = window
-	if posting_date is None:
+	if posting_datetime is None:
 		return "Possible"
-	if start and posting_date < start:
+	if start and posting_datetime < start:
 		return "Possible"
-	if end and posting_date > end:
+	if end and posting_datetime > end:
 		return "Possible"
 	return "Confirmed"
 
@@ -215,8 +246,8 @@ def _match_standard_doctype(doctype, currency, rate, rate_type, companies, windo
 			conversion_rate only means what the log claims for a document belonging to one
 			of these. Empty means "couldn't determine any", so the filter is skipped rather
 			than excluding everything (see _companies_with_currency).
-		window (tuple[date | None, date | None]): this rate's active period, for
-			match_confidence — see _rate_windows.
+		window (tuple[datetime | None, datetime | None]): this rate's active period,
+			for match_confidence — see _rate_windows.
 
 	Returns:
 		list[dict]: usage child-table rows for matches found.
@@ -225,10 +256,12 @@ def _match_standard_doctype(doctype, currency, rate, rate_type, companies, windo
 	if companies:
 		filters["company"] = ["in", companies]
 
+	# All five standard doctypes carry posting_time alongside posting_date, so
+	# match_confidence gets real timestamp precision here, not just a day.
 	matches = frappe.get_all(
 		doctype,
 		filters=filters,
-		fields=["name", "posting_date", "grand_total", "currency"],
+		fields=["name", "posting_date", "posting_time", "grand_total", "currency"],
 	)
 	return [
 		{
@@ -238,7 +271,7 @@ def _match_standard_doctype(doctype, currency, rate, rate_type, companies, windo
 			"currency": m.currency,
 			"amount": m.grand_total,
 			"rate_type": rate_type,
-			"match_confidence": _confidence(m.posting_date, window),
+			"match_confidence": _confidence(_posting_datetime(m.posting_date, m.posting_time), window),
 		}
 		for m in matches
 	]
@@ -252,13 +285,15 @@ def _match_payment_entry(currency, rate, rate_type, companies, window):
 		rate (float): source_exchange_rate / target_exchange_rate value to match exactly.
 		rate_type (str): "Old Rate" or "New Rate", recorded on each usage row.
 		companies (list[str]): see _match_standard_doctype; skipped if empty.
-		window (tuple[date | None, date | None]): see _match_standard_doctype.
+		window (tuple[datetime | None, datetime | None]): see _match_standard_doctype.
 
 	Returns:
 		list[dict]: usage child-table rows for matches found.
 	"""
 	rows = []
 
+	# Payment Entry has no posting_time field in ERPNext — day-level is the best
+	# precision actually available here (see _posting_datetime).
 	source_filters = {
 		"paid_from_account_currency": currency,
 		"source_exchange_rate": rate,
@@ -280,7 +315,7 @@ def _match_payment_entry(currency, rate, rate_type, companies, window):
 			"currency": m.paid_from_account_currency,
 			"amount": m.paid_amount,
 			"rate_type": rate_type,
-			"match_confidence": _confidence(m.posting_date, window),
+			"match_confidence": _confidence(_posting_datetime(m.posting_date), window),
 		}
 		for m in source_matches
 	]
@@ -306,7 +341,7 @@ def _match_payment_entry(currency, rate, rate_type, companies, window):
 			"currency": m.paid_to_account_currency,
 			"amount": m.received_amount,
 			"rate_type": rate_type,
-			"match_confidence": _confidence(m.posting_date, window),
+			"match_confidence": _confidence(_posting_datetime(m.posting_date), window),
 		}
 		for m in target_matches
 	]
@@ -323,7 +358,7 @@ def _match_journal_entry(currency, rate, rate_type, companies, window):
 		rate_type (str): "Old Rate" or "New Rate", recorded on each usage row.
 		companies (list[str]): see _match_standard_doctype; skipped if empty. Applied on
 			the parent Journal Entry, since company isn't a field on the child row itself.
-		window (tuple[date | None, date | None]): see _match_standard_doctype.
+		window (tuple[datetime | None, datetime | None]): see _match_standard_doctype.
 
 	Returns:
 		list[dict]: usage child-table rows for matches found.
@@ -346,6 +381,8 @@ def _match_journal_entry(currency, rate, rate_type, companies, window):
 	if companies:
 		parent_filters["company"] = ["in", companies]
 
+	# Journal Entry has no posting_time field either — same day-level limitation as
+	# Payment Entry (see _posting_datetime).
 	posting_dates = {
 		p.name: p.posting_date
 		for p in frappe.get_all("Journal Entry", filters=parent_filters, fields=["name", "posting_date"])
@@ -364,7 +401,7 @@ def _match_journal_entry(currency, rate, rate_type, companies, window):
 				"currency": m.account_currency,
 				"amount": flt(m.debit_in_account_currency) or flt(m.credit_in_account_currency),
 				"rate_type": rate_type,
-				"match_confidence": _confidence(posting_date, window),
+				"match_confidence": _confidence(_posting_datetime(posting_date), window),
 			}
 		)
 

@@ -171,28 +171,70 @@ class TestCompaniesWithCurrency(FrappeTestCase):
 
 class TestConfidence(FrappeTestCase):
 	def test_confirmed_when_inside_the_window(self):
-		window = (frappe.utils.getdate("2024-01-10"), frappe.utils.getdate("2024-02-10"))
-		self.assertEqual(matching._confidence(frappe.utils.getdate("2024-01-20"), window), "Confirmed")
+		window = (
+			frappe.utils.get_datetime("2024-01-10 09:00:00"),
+			frappe.utils.get_datetime("2024-02-10 17:00:00"),
+		)
+		self.assertEqual(
+			matching._confidence(frappe.utils.get_datetime("2024-01-20 12:00:00"), window), "Confirmed"
+		)
 
 	def test_confirmed_on_window_boundaries_inclusive(self):
-		# changed_on only has day precision here, so the transition day itself can't
-		# be split between the old and new rate — both ends are inclusive.
-		start, end = frappe.utils.getdate("2024-01-10"), frappe.utils.getdate("2024-02-10")
+		# Inclusive at both ends as a safety margin for an exact-instant match.
+		start = frappe.utils.get_datetime("2024-01-10 09:00:00")
+		end = frappe.utils.get_datetime("2024-02-10 17:00:00")
 		self.assertEqual(matching._confidence(start, (start, end)), "Confirmed")
 		self.assertEqual(matching._confidence(end, (start, end)), "Confirmed")
 
-	def test_possible_when_outside_the_window(self):
-		window = (frappe.utils.getdate("2024-01-10"), frappe.utils.getdate("2024-02-10"))
-		self.assertEqual(matching._confidence(frappe.utils.getdate("2024-03-01"), window), "Possible")
-		self.assertEqual(matching._confidence(frappe.utils.getdate("2023-12-01"), window), "Possible")
+	def test_distinguishes_before_and_after_within_the_same_day(self):
+		# The whole point of full-timestamp precision over day-level: a transaction
+		# an hour before the rate changed and one an hour after, on the SAME day,
+		# must not be treated as equally ambiguous.
+		change_instant = frappe.utils.get_datetime("2024-01-10 14:00:00")
+		window_before = (None, change_instant)
+		window_after = (change_instant, None)
 
-	def test_possible_when_posting_date_is_missing(self):
+		just_before = frappe.utils.get_datetime("2024-01-10 13:00:00")
+		just_after = frappe.utils.get_datetime("2024-01-10 15:00:00")
+
+		self.assertEqual(matching._confidence(just_before, window_before), "Confirmed")
+		self.assertEqual(matching._confidence(just_before, window_after), "Possible")
+		self.assertEqual(matching._confidence(just_after, window_after), "Confirmed")
+		self.assertEqual(matching._confidence(just_after, window_before), "Possible")
+
+	def test_possible_when_outside_the_window(self):
+		window = (
+			frappe.utils.get_datetime("2024-01-10 00:00:00"),
+			frappe.utils.get_datetime("2024-02-10 00:00:00"),
+		)
+		self.assertEqual(matching._confidence(frappe.utils.get_datetime("2024-03-01 00:00:00"), window), "Possible")
+		self.assertEqual(matching._confidence(frappe.utils.get_datetime("2023-12-01 00:00:00"), window), "Possible")
+
+	def test_possible_when_posting_datetime_is_missing(self):
 		self.assertEqual(matching._confidence(None, (None, None)), "Possible")
 
 	def test_confirmed_with_an_open_ended_window(self):
 		# No prior/next sibling entry — an unbounded side of the window imposes no
 		# constraint on that side.
-		self.assertEqual(matching._confidence(frappe.utils.getdate("2020-01-01"), (None, None)), "Confirmed")
+		self.assertEqual(
+			matching._confidence(frappe.utils.get_datetime("2020-01-01 00:00:00"), (None, None)), "Confirmed"
+		)
+
+
+class TestPostingDatetime(FrappeTestCase):
+	"""Sales Invoice etc. carry posting_time (real precision); Payment Entry and
+	Journal Entry don't (day-level is the honest ceiling for those)."""
+
+	def test_combines_date_and_time(self):
+		combined = matching._posting_datetime(frappe.utils.getdate("2024-01-10"), frappe.utils.get_time("14:30:00"))
+		self.assertEqual(combined, frappe.utils.get_datetime("2024-01-10 14:30:00"))
+
+	def test_falls_back_to_midnight_without_a_time(self):
+		combined = matching._posting_datetime(frappe.utils.getdate("2024-01-10"))
+		self.assertEqual(combined, frappe.utils.get_datetime("2024-01-10 00:00:00"))
+
+	def test_none_when_date_is_missing(self):
+		self.assertIsNone(matching._posting_datetime(None))
 
 
 class TestRateWindows(FrappeTestCase):
@@ -201,10 +243,12 @@ class TestRateWindows(FrappeTestCase):
 
 	def test_windows_for_a_cycling_rate(self):
 		currency_exchange = get_or_create_currency_exchange("USD", "BHD", 52.0)
+		# Same-day, different times — proves this isn't truncated to a date anywhere
+		# along the way.
 		t1, t2, t3 = (
-			frappe.utils.get_datetime("2024-01-01 00:00:00"),
-			frappe.utils.get_datetime("2024-02-01 00:00:00"),
-			frappe.utils.get_datetime("2024-03-01 00:00:00"),
+			frappe.utils.get_datetime("2024-01-01 09:00:00"),
+			frappe.utils.get_datetime("2024-01-01 13:00:00"),
+			frappe.utils.get_datetime("2024-01-01 17:00:00"),
 		)
 		with patch("currency_audit.utils.frappe.enqueue"):
 			log_a = make_log(currency_exchange, old_rate=50.0, new_rate=52.0)
@@ -219,16 +263,16 @@ class TestRateWindows(FrappeTestCase):
 		log_c.reload()
 
 		windows_a = matching._rate_windows(log_a)
-		self.assertEqual(windows_a["New Rate"], (frappe.utils.getdate(t1), frappe.utils.getdate(t2)))
+		self.assertEqual(windows_a["New Rate"], (t1, t2))
 
 		windows_b = matching._rate_windows(log_b)
-		self.assertEqual(windows_b["Old Rate"], (frappe.utils.getdate(t1), frappe.utils.getdate(t2)))
-		self.assertEqual(windows_b["New Rate"], (frappe.utils.getdate(t2), frappe.utils.getdate(t3)))
+		self.assertEqual(windows_b["Old Rate"], (t1, t2))
+		self.assertEqual(windows_b["New Rate"], (t2, t3))
 
 		windows_c = matching._rate_windows(log_c)
-		self.assertEqual(windows_c["Old Rate"], (frappe.utils.getdate(t2), frappe.utils.getdate(t3)))
+		self.assertEqual(windows_c["Old Rate"], (t2, t3))
 		# Latest entry for this record — open-ended on the right.
-		self.assertEqual(windows_c["New Rate"], (frappe.utils.getdate(t3), None))
+		self.assertEqual(windows_c["New Rate"], (t3, None))
 
 	def test_first_entry_has_no_prior_window(self):
 		currency_exchange = get_or_create_currency_exchange("USD", "OMR", 0.385)
@@ -285,6 +329,55 @@ class TestRunMatchingJobConfidence(FrappeTestCase):
 
 		self.assertEqual(usage_by_name[clean_invoice.name].match_confidence, "Confirmed")
 		self.assertEqual(usage_by_name[odd_invoice.name].match_confidence, "Possible")
+
+	def test_distinguishes_same_day_invoices_by_posting_time(self):
+		# The actual point of switching from day-level to timestamp-level: two
+		# invoices on the SAME calendar day, one before the rate changed and one
+		# after, must not be treated as equally uncertain.
+		from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
+
+		currency_exchange = get_or_create_currency_exchange("USD", "QAR", 3.64)
+		change_instant = frappe.utils.get_datetime("2024-05-01 14:00:00")
+		with patch("currency_audit.utils.frappe.enqueue"):
+			log = make_log(currency_exchange, old_rate=3.60, new_rate=3.64)
+			frappe.db.set_value(
+				"Currency Exchange Log", log.name, "changed_on", change_instant, update_modified=False
+			)
+
+		before_invoice = create_sales_invoice(
+			company="_Test Company",
+			customer="_Test Customer USD",
+			debit_to="_Test Receivable USD - _TC",
+			currency="USD",
+			conversion_rate=3.64,
+			posting_date="2024-05-01",
+			do_not_submit=1,
+		)
+		before_invoice.posting_time = "10:00:00"
+		before_invoice.save()
+		before_invoice.submit()
+
+		after_invoice = create_sales_invoice(
+			company="_Test Company",
+			customer="_Test Customer USD",
+			debit_to="_Test Receivable USD - _TC",
+			currency="USD",
+			conversion_rate=3.64,
+			posting_date="2024-05-01",
+			do_not_submit=1,
+		)
+		after_invoice.posting_time = "18:00:00"
+		after_invoice.save()
+		after_invoice.submit()
+
+		matching.run_matching_job(log.name)
+		log.reload()
+		usage_by_name = {row.reference_name: row for row in log.usage}
+
+		# Same day as the change, but claims the new rate 4 hours before it took
+		# effect — a real inconsistency, correctly flagged despite sharing a date.
+		self.assertEqual(usage_by_name[before_invoice.name].match_confidence, "Possible")
+		self.assertEqual(usage_by_name[after_invoice.name].match_confidence, "Confirmed")
 
 
 class TestRunMatchingJob(FrappeTestCase):
