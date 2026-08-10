@@ -6,3 +6,5 @@
 # Patches added in this section will be executed after doctypes are migrated
 currency_audit.patches.baseline_backfill
 currency_audit.patches.correct_baseline_attribution
+currency_audit.patches.reconcile_historical_versions
+currency_audit.patches.recompute_matching_with_confidence

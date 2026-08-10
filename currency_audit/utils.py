@@ -11,16 +11,27 @@ from frappe.utils import now_datetime
 from currency_audit.matching import matching_job_id
 
 
-def create_log_entry(currency_exchange, new_rate, old_rate=None, entry_type="Change", changed_by=None, changed_on=None):
+def create_log_entry(
+	currency_exchange,
+	new_rate,
+	old_rate=None,
+	entry_type="Change",
+	changed_by=None,
+	changed_on=None,
+	source_version=None,
+):
 	"""Create an immutable Currency Exchange Log entry and enqueue the F4 matching job.
 
 	Args:
 		currency_exchange (Document): the source Currency Exchange document the log is about.
 		new_rate (float): the rate value to record as the current/new value.
 		old_rate (float | None): the prior rate value; None for baseline entries (F6).
-		entry_type (str): "Change" or "Baseline".
+		entry_type (str): "Change", "Baseline", or "Recovered" (found via Version-history
+			reconciliation — see currency_audit.reconciliation).
 		changed_by (str | None): user who made the change; defaults to the current session user.
 		changed_on (datetime | None): when the change happened; defaults to now.
+		source_version (str | None): name of the Frappe Version record this entry was
+			reconstructed from, for Recovered entries only.
 
 	Returns:
 		str: name of the created Currency Exchange Log document.
@@ -36,6 +47,7 @@ def create_log_entry(currency_exchange, new_rate, old_rate=None, entry_type="Cha
 			"new_rate": new_rate,
 			"changed_by": changed_by or frappe.session.user,
 			"changed_on": changed_on or now_datetime(),
+			"source_version": source_version,
 		}
 	)
 	log.insert(ignore_permissions=True)

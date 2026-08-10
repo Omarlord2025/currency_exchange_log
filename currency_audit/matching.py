@@ -13,7 +13,7 @@ against every transaction doctype that snapshots a conversion rate:
 import time
 
 import frappe
-from frappe.utils import add_to_date, flt, now_datetime
+from frappe.utils import add_to_date, flt, getdate, now_datetime
 
 STANDARD_DOCTYPES = (
 	"Sales Invoice",
@@ -60,15 +60,17 @@ def run_matching_job(log_name):
 		try:
 			log = frappe.get_doc("Currency Exchange Log", log_name)
 			companies = _companies_with_currency(log.to_currency)
+			windows = _rate_windows(log)
 			rows = []
 			for rate_type, rate in (("Old Rate", log.old_rate), ("New Rate", log.new_rate)):
 				if not rate:
 					continue
 				rate = flt(rate, 9)
+				window = windows[rate_type]
 				for doctype in STANDARD_DOCTYPES:
-					rows += _match_standard_doctype(doctype, log.from_currency, rate, rate_type, companies)
-				rows += _match_payment_entry(log.from_currency, rate, rate_type, companies)
-				rows += _match_journal_entry(log.from_currency, rate, rate_type, companies)
+					rows += _match_standard_doctype(doctype, log.from_currency, rate, rate_type, companies, window)
+				rows += _match_payment_entry(log.from_currency, rate, rate_type, companies, window)
+				rows += _match_journal_entry(log.from_currency, rate, rate_type, companies, window)
 
 			log.set("usage", rows)
 			log.matching_status = "Completed"
@@ -139,7 +141,69 @@ def _companies_with_currency(currency):
 	return companies
 
 
-def _match_standard_doctype(doctype, currency, rate, rate_type, companies):
+def _rate_windows(log):
+	"""The posting_date period each of this log's old_rate/new_rate was actually
+	active for, based on this log's own Currency Exchange record's chronological
+	history of entries — the mechanism behind match_confidence (Confirmed/Possible).
+
+	Point 10/13: a rate value can recur (50 -> 52 -> 50 -> 52) without a matching
+	transaction's currency+rate alone being enough to say which occurrence it
+	belongs to. This never excludes a match on that basis (Principle 2: value match,
+	not date match) — it only labels confidence, so an ambiguous case is still shown,
+	just flagged for a second look instead of presented with false certainty.
+
+	Args:
+		log (Document): the Currency Exchange Log entry being matched.
+
+	Returns:
+		dict: {"Old Rate": (start, end), "New Rate": (start, end)}, each a
+			(date | None, date | None) tuple — a window bound is None when open-ended
+			(no entry before/after this one for the same Currency Exchange record).
+	"""
+	siblings = frappe.get_all(
+		"Currency Exchange Log",
+		filters={"currency_exchange": log.currency_exchange},
+		fields=["name", "changed_on"],
+		order_by="changed_on asc",
+	)
+	names = [s.name for s in siblings]
+	dates = [getdate(s.changed_on) for s in siblings]
+
+	if log.name not in names:
+		# Not yet visible in this ordering (e.g. mid-insert in a test) — no basis to
+		# score confidence, so leave both windows fully open rather than guessing.
+		return {"Old Rate": (None, None), "New Rate": (None, None)}
+
+	idx = names.index(log.name)
+	return {
+		"Old Rate": (dates[idx - 1] if idx > 0 else None, dates[idx]),
+		"New Rate": (dates[idx], dates[idx + 1] if idx + 1 < len(dates) else None),
+	}
+
+
+def _confidence(posting_date, window):
+	"""Confirmed if posting_date falls within [start, end] (inclusive both ends —
+	changed_on only has day precision here, so the transition day itself can't be
+	split between the old and new rate), else Possible.
+
+	Args:
+		posting_date (date | None): the matched document's posting date.
+		window (tuple[date | None, date | None]): this rate's active period.
+
+	Returns:
+		str: "Confirmed" or "Possible".
+	"""
+	start, end = window
+	if posting_date is None:
+		return "Possible"
+	if start and posting_date < start:
+		return "Possible"
+	if end and posting_date > end:
+		return "Possible"
+	return "Confirmed"
+
+
+def _match_standard_doctype(doctype, currency, rate, rate_type, companies, window):
 	"""Match submitted documents of one of the five standard doctypes against a rate.
 
 	Args:
@@ -151,6 +215,8 @@ def _match_standard_doctype(doctype, currency, rate, rate_type, companies):
 			conversion_rate only means what the log claims for a document belonging to one
 			of these. Empty means "couldn't determine any", so the filter is skipped rather
 			than excluding everything (see _companies_with_currency).
+		window (tuple[date | None, date | None]): this rate's active period, for
+			match_confidence — see _rate_windows.
 
 	Returns:
 		list[dict]: usage child-table rows for matches found.
@@ -172,12 +238,13 @@ def _match_standard_doctype(doctype, currency, rate, rate_type, companies):
 			"currency": m.currency,
 			"amount": m.grand_total,
 			"rate_type": rate_type,
+			"match_confidence": _confidence(m.posting_date, window),
 		}
 		for m in matches
 	]
 
 
-def _match_payment_entry(currency, rate, rate_type, companies):
+def _match_payment_entry(currency, rate, rate_type, companies, window):
 	"""Match submitted Payment Entries against a rate on either side of the transaction.
 
 	Args:
@@ -185,6 +252,7 @@ def _match_payment_entry(currency, rate, rate_type, companies):
 		rate (float): source_exchange_rate / target_exchange_rate value to match exactly.
 		rate_type (str): "Old Rate" or "New Rate", recorded on each usage row.
 		companies (list[str]): see _match_standard_doctype; skipped if empty.
+		window (tuple[date | None, date | None]): see _match_standard_doctype.
 
 	Returns:
 		list[dict]: usage child-table rows for matches found.
@@ -212,6 +280,7 @@ def _match_payment_entry(currency, rate, rate_type, companies):
 			"currency": m.paid_from_account_currency,
 			"amount": m.paid_amount,
 			"rate_type": rate_type,
+			"match_confidence": _confidence(m.posting_date, window),
 		}
 		for m in source_matches
 	]
@@ -237,6 +306,7 @@ def _match_payment_entry(currency, rate, rate_type, companies):
 			"currency": m.paid_to_account_currency,
 			"amount": m.received_amount,
 			"rate_type": rate_type,
+			"match_confidence": _confidence(m.posting_date, window),
 		}
 		for m in target_matches
 	]
@@ -244,7 +314,7 @@ def _match_payment_entry(currency, rate, rate_type, companies):
 	return rows
 
 
-def _match_journal_entry(currency, rate, rate_type, companies):
+def _match_journal_entry(currency, rate, rate_type, companies, window):
 	"""Match submitted Journal Entry rows (per-line rate/currency) against a rate.
 
 	Args:
@@ -253,6 +323,7 @@ def _match_journal_entry(currency, rate, rate_type, companies):
 		rate_type (str): "Old Rate" or "New Rate", recorded on each usage row.
 		companies (list[str]): see _match_standard_doctype; skipped if empty. Applied on
 			the parent Journal Entry, since company isn't a field on the child row itself.
+		window (tuple[date | None, date | None]): see _match_standard_doctype.
 
 	Returns:
 		list[dict]: usage child-table rows for matches found.
@@ -284,14 +355,16 @@ def _match_journal_entry(currency, rate, rate_type, companies):
 		if m.parent not in posting_dates:
 			# Parent's company doesn't match the log's to_currency — not this log's match.
 			continue
+		posting_date = posting_dates.get(m.parent)
 		rows.append(
 			{
 				"reference_doctype": "Journal Entry",
 				"reference_name": m.parent,
-				"posting_date": posting_dates.get(m.parent),
+				"posting_date": posting_date,
 				"currency": m.account_currency,
 				"amount": flt(m.debit_in_account_currency) or flt(m.credit_in_account_currency),
 				"rate_type": rate_type,
+				"match_confidence": _confidence(posting_date, window),
 			}
 		)
 

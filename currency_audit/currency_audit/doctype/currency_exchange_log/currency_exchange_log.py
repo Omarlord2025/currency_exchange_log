@@ -14,6 +14,7 @@ PROTECTED_FIELDS = (
 	"new_rate",
 	"changed_by",
 	"changed_on",
+	"source_version",
 )
 
 

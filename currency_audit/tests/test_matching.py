@@ -21,9 +21,12 @@ from currency_audit.test_helpers import get_or_create_currency_exchange, make_lo
 # fixtures these tests need (_Test Customer USD, _Test Receivable/Bank USD - _TC, etc.)
 # are standard ERPNext test records already present on this site.
 
-# companies=[] disables the company/to_currency scoping (see TestCompanyScoping) so
-# these tests can focus purely on the currency+rate matching mechanics.
+# companies=[] disables the company/to_currency scoping (see TestCompanyScoping), and
+# (None, None) disables the date-window confidence scoring (see TestRateWindows /
+# TestConfidence) — so these tests can focus purely on the currency+rate matching
+# mechanics without either extra dimension in play.
 NO_COMPANY_SCOPE = []
+OPEN_WINDOW = (None, None)
 
 
 class TestMatchStandardDoctype(FrappeTestCase):
@@ -44,7 +47,9 @@ class TestMatchStandardDoctype(FrappeTestCase):
 		)
 
 	def test_matches_submitted_invoice_by_currency_and_rate(self):
-		rows = matching._match_standard_doctype("Sales Invoice", "USD", self.rate, "New Rate", NO_COMPANY_SCOPE)
+		rows = matching._match_standard_doctype(
+			"Sales Invoice", "USD", self.rate, "New Rate", NO_COMPANY_SCOPE, OPEN_WINDOW
+		)
 		names = [r["reference_name"] for r in rows]
 		self.assertIn(self.invoice.name, names)
 
@@ -56,7 +61,7 @@ class TestMatchStandardDoctype(FrappeTestCase):
 
 	def test_does_not_match_a_different_rate(self):
 		rows = matching._match_standard_doctype(
-			"Sales Invoice", "USD", self.rate + 1, "New Rate", NO_COMPANY_SCOPE
+			"Sales Invoice", "USD", self.rate + 1, "New Rate", NO_COMPANY_SCOPE, OPEN_WINDOW
 		)
 		names = [r["reference_name"] for r in rows]
 		self.assertNotIn(self.invoice.name, names)
@@ -86,7 +91,7 @@ class TestMatchPaymentEntry(FrappeTestCase):
 		cls.payment_entry = pe
 
 	def test_matches_on_source_side(self):
-		rows = matching._match_payment_entry("USD", self.rate, "Old Rate", NO_COMPANY_SCOPE)
+		rows = matching._match_payment_entry("USD", self.rate, "Old Rate", NO_COMPANY_SCOPE, OPEN_WINDOW)
 		names = [r["reference_name"] for r in rows]
 		self.assertIn(self.payment_entry.name, names)
 
@@ -108,7 +113,7 @@ class TestMatchJournalEntry(FrappeTestCase):
 		cls.journal_entry = jv
 
 	def test_matches_on_the_usd_row(self):
-		rows = matching._match_journal_entry("USD", self.rate, "New Rate", NO_COMPANY_SCOPE)
+		rows = matching._match_journal_entry("USD", self.rate, "New Rate", NO_COMPANY_SCOPE, OPEN_WINDOW)
 		names = [r["reference_name"] for r in rows]
 		self.assertIn(self.journal_entry.name, names)
 
@@ -134,21 +139,23 @@ class TestCompanyScoping(FrappeTestCase):
 		)
 
 	def test_matches_when_company_scope_includes_the_invoice_company(self):
-		rows = matching._match_standard_doctype("Sales Invoice", "USD", self.rate, "New Rate", ["_Test Company"])
+		rows = matching._match_standard_doctype(
+			"Sales Invoice", "USD", self.rate, "New Rate", ["_Test Company"], OPEN_WINDOW
+		)
 		self.assertIn(self.invoice.name, [r["reference_name"] for r in rows])
 
 	def test_does_not_match_when_company_scope_excludes_the_invoice_company(self):
 		# Same currency, same rate value — only the target currency (and therefore
 		# company) differs. This is exactly the false-positive Point C described.
 		rows = matching._match_standard_doctype(
-			"Sales Invoice", "USD", self.rate, "New Rate", ["_Test Company 2"]
+			"Sales Invoice", "USD", self.rate, "New Rate", ["_Test Company 2"], OPEN_WINDOW
 		)
 		self.assertNotIn(self.invoice.name, [r["reference_name"] for r in rows])
 
 	def test_empty_company_scope_falls_back_to_unrestricted(self):
 		# companies=[] means "couldn't determine any" (e.g. an unrecognised currency),
 		# not "match nothing" — the filter must be skipped, not applied as empty IN().
-		rows = matching._match_standard_doctype("Sales Invoice", "USD", self.rate, "New Rate", [])
+		rows = matching._match_standard_doctype("Sales Invoice", "USD", self.rate, "New Rate", [], OPEN_WINDOW)
 		self.assertIn(self.invoice.name, [r["reference_name"] for r in rows])
 
 
@@ -160,6 +167,124 @@ class TestCompaniesWithCurrency(FrappeTestCase):
 	def test_returns_empty_list_for_an_unused_currency(self):
 		companies = matching._companies_with_currency("XTS")
 		self.assertEqual(companies, [])
+
+
+class TestConfidence(FrappeTestCase):
+	def test_confirmed_when_inside_the_window(self):
+		window = (frappe.utils.getdate("2024-01-10"), frappe.utils.getdate("2024-02-10"))
+		self.assertEqual(matching._confidence(frappe.utils.getdate("2024-01-20"), window), "Confirmed")
+
+	def test_confirmed_on_window_boundaries_inclusive(self):
+		# changed_on only has day precision here, so the transition day itself can't
+		# be split between the old and new rate — both ends are inclusive.
+		start, end = frappe.utils.getdate("2024-01-10"), frappe.utils.getdate("2024-02-10")
+		self.assertEqual(matching._confidence(start, (start, end)), "Confirmed")
+		self.assertEqual(matching._confidence(end, (start, end)), "Confirmed")
+
+	def test_possible_when_outside_the_window(self):
+		window = (frappe.utils.getdate("2024-01-10"), frappe.utils.getdate("2024-02-10"))
+		self.assertEqual(matching._confidence(frappe.utils.getdate("2024-03-01"), window), "Possible")
+		self.assertEqual(matching._confidence(frappe.utils.getdate("2023-12-01"), window), "Possible")
+
+	def test_possible_when_posting_date_is_missing(self):
+		self.assertEqual(matching._confidence(None, (None, None)), "Possible")
+
+	def test_confirmed_with_an_open_ended_window(self):
+		# No prior/next sibling entry — an unbounded side of the window imposes no
+		# constraint on that side.
+		self.assertEqual(matching._confidence(frappe.utils.getdate("2020-01-01"), (None, None)), "Confirmed")
+
+
+class TestRateWindows(FrappeTestCase):
+	"""Point 10/13: a rate value can recur (50 -> 52 -> 50 -> 52) — these windows are
+	what let match_confidence tell those occurrences apart by when they were active."""
+
+	def test_windows_for_a_cycling_rate(self):
+		currency_exchange = get_or_create_currency_exchange("USD", "BHD", 52.0)
+		t1, t2, t3 = (
+			frappe.utils.get_datetime("2024-01-01 00:00:00"),
+			frappe.utils.get_datetime("2024-02-01 00:00:00"),
+			frappe.utils.get_datetime("2024-03-01 00:00:00"),
+		)
+		with patch("currency_audit.utils.frappe.enqueue"):
+			log_a = make_log(currency_exchange, old_rate=50.0, new_rate=52.0)
+			frappe.db.set_value("Currency Exchange Log", log_a.name, "changed_on", t1, update_modified=False)
+			log_b = make_log(currency_exchange, old_rate=52.0, new_rate=50.0)
+			frappe.db.set_value("Currency Exchange Log", log_b.name, "changed_on", t2, update_modified=False)
+			log_c = make_log(currency_exchange, old_rate=50.0, new_rate=52.0)
+			frappe.db.set_value("Currency Exchange Log", log_c.name, "changed_on", t3, update_modified=False)
+
+		log_a.reload()
+		log_b.reload()
+		log_c.reload()
+
+		windows_a = matching._rate_windows(log_a)
+		self.assertEqual(windows_a["New Rate"], (frappe.utils.getdate(t1), frappe.utils.getdate(t2)))
+
+		windows_b = matching._rate_windows(log_b)
+		self.assertEqual(windows_b["Old Rate"], (frappe.utils.getdate(t1), frappe.utils.getdate(t2)))
+		self.assertEqual(windows_b["New Rate"], (frappe.utils.getdate(t2), frappe.utils.getdate(t3)))
+
+		windows_c = matching._rate_windows(log_c)
+		self.assertEqual(windows_c["Old Rate"], (frappe.utils.getdate(t2), frappe.utils.getdate(t3)))
+		# Latest entry for this record — open-ended on the right.
+		self.assertEqual(windows_c["New Rate"], (frappe.utils.getdate(t3), None))
+
+	def test_first_entry_has_no_prior_window(self):
+		currency_exchange = get_or_create_currency_exchange("USD", "OMR", 0.385)
+		with patch("currency_audit.utils.frappe.enqueue"):
+			log = make_log(currency_exchange, old_rate=0.38, new_rate=0.385)
+
+		windows = matching._rate_windows(log)
+		self.assertIsNone(windows["Old Rate"][0])
+
+
+class TestRunMatchingJobConfidence(FrappeTestCase):
+	"""End-to-end: the 50 -> 52 -> 50 -> 52 scenario, matched against real invoices."""
+
+	def test_tags_confirmed_and_possible_correctly(self):
+		from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
+
+		currency_exchange = get_or_create_currency_exchange("USD", "KWD", 52.0)
+		t1, t2, t3 = (
+			frappe.utils.get_datetime("2024-01-01 00:00:00"),
+			frappe.utils.get_datetime("2024-02-01 00:00:00"),
+			frappe.utils.get_datetime("2024-03-01 00:00:00"),
+		)
+		with patch("currency_audit.utils.frappe.enqueue"):
+			log_a = make_log(currency_exchange, old_rate=50.0, new_rate=52.0)
+			frappe.db.set_value("Currency Exchange Log", log_a.name, "changed_on", t1, update_modified=False)
+			log_b = make_log(currency_exchange, old_rate=52.0, new_rate=50.0)
+			frappe.db.set_value("Currency Exchange Log", log_b.name, "changed_on", t2, update_modified=False)
+			log_c = make_log(currency_exchange, old_rate=50.0, new_rate=52.0)
+			frappe.db.set_value("Currency Exchange Log", log_c.name, "changed_on", t3, update_modified=False)
+
+		# Genuinely used 52 during log_a's window (Jan) — should be Confirmed there.
+		clean_invoice = create_sales_invoice(
+			company="_Test Company",
+			customer="_Test Customer USD",
+			debit_to="_Test Receivable USD - _TC",
+			currency="USD",
+			conversion_rate=52.0,
+			posting_date="2024-01-15",
+		)
+		# Claims 52 but is dated inside log_b's window (Feb, when the rate was
+		# actually 50) — a genuine inconsistency, should be Possible under log_a.
+		odd_invoice = create_sales_invoice(
+			company="_Test Company",
+			customer="_Test Customer USD",
+			debit_to="_Test Receivable USD - _TC",
+			currency="USD",
+			conversion_rate=52.0,
+			posting_date="2024-02-15",
+		)
+
+		matching.run_matching_job(log_a.name)
+		log_a.reload()
+		usage_by_name = {row.reference_name: row for row in log_a.usage}
+
+		self.assertEqual(usage_by_name[clean_invoice.name].match_confidence, "Confirmed")
+		self.assertEqual(usage_by_name[odd_invoice.name].match_confidence, "Possible")
 
 
 class TestRunMatchingJob(FrappeTestCase):

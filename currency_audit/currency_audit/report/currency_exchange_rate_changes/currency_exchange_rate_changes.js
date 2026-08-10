@@ -37,7 +37,7 @@ frappe.query_reports["Currency Exchange Rate Changes"] = {
 			"fieldname": "entry_type",
 			"label": __("Entry Type"),
 			"fieldtype": "Select",
-			"options": ["", "Change", "Baseline"],
+			"options": ["", "Change", "Baseline", "Recovered"],
 		},
 		{
 			"fieldname": "matching_status",

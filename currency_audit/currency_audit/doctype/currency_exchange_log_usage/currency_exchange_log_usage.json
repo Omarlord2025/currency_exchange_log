@@ -11,7 +11,8 @@
   "posting_date",
   "rate_type",
   "currency",
-  "amount"
+  "amount",
+  "match_confidence"
  ],
  "fields": [
   {
@@ -64,13 +65,22 @@
    "in_list_view": 1,
    "label": "Amount",
    "options": "currency"
+  },
+  {
+   "columns": 1,
+   "description": "Confirmed: this document's posting date falls within the period this rate was actually active. Possible: the rate value matches exactly, but the date doesn't line up \u2014 e.g. the rate returned to a value it had before, so the same number could belong to more than one point in its history. Still a real value match either way (see Principle 2) \u2014 this only flags which ones are worth a second look.",
+   "fieldname": "match_confidence",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Match Confidence",
+   "options": "Confirmed\nPossible"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-08-09 15:48:28.205687",
+ "modified": "2026-08-10 18:07:45.463901",
  "modified_by": "Administrator",
  "module": "Currency Audit",
  "name": "Currency Exchange Log Usage",

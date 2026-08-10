@@ -32,12 +32,17 @@ INDEXED_FIELDS = (
 
 
 def after_install():
-	"""Add the F4 matching job's DB indexes and run the F6 baseline backfill."""
+	"""Add the F4 matching job's DB indexes, run the F6 baseline backfill, and catch
+	up on any Version history already sitting there (e.g. a reinstall on a site that
+	had currency_audit before) — same set_all_patches_as_completed reasoning as
+	baseline_backfill applies to every patches.txt entry, not just that one."""
 	add_matching_indexes()
 
 	from currency_audit.patches.baseline_backfill import execute as run_baseline_backfill
+	from currency_audit.reconciliation import reconcile_version_history
 
 	run_baseline_backfill()
+	reconcile_version_history(since=None)
 
 
 def add_matching_indexes():
