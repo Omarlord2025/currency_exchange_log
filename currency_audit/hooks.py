@@ -145,6 +145,12 @@ doc_events = {
 # Scheduled Tasks
 # ---------------
 
+scheduler_events = {
+	"cron": {
+		"*/15 * * * *": ["currency_audit.matching.retry_stuck_matches"],
+	},
+}
+
 # scheduler_events = {
 # 	"all": [
 # 		"currency_audit.tasks.all"

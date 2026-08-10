@@ -31,10 +31,16 @@ def _enable_track_changes():
 
 
 def _create_baseline_logs():
-	"""Create a baseline Currency Exchange Log for every existing Currency Exchange record."""
+	"""Create a baseline Currency Exchange Log for every existing Currency Exchange record.
+
+	`changed_by`/`changed_on` are taken from the source Currency Exchange record's own
+	`modified_by`/`modified` — whoever actually last set that rate — not from the
+	session running this patch (which is always Administrator/CLI and would otherwise
+	misattribute every baseline entry to whoever happened to run `bench migrate`).
+	"""
 	existing = frappe.get_all(
 		"Currency Exchange",
-		fields=["name", "from_currency", "to_currency", "exchange_rate"],
+		fields=["name", "from_currency", "to_currency", "exchange_rate", "modified_by", "modified"],
 	)
 	if not existing:
 		return
@@ -55,4 +61,6 @@ def _create_baseline_logs():
 			new_rate=row.exchange_rate,
 			old_rate=None,
 			entry_type="Baseline",
+			changed_by=row.modified_by,
+			changed_on=row.modified,
 		)

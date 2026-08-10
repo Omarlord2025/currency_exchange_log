@@ -6,6 +6,8 @@ Note per PRD F4), plus the two doctypes with their own matching logic: Payment E
 (rate per side) and Journal Entry (rate per child-table row).
 """
 
+from unittest.mock import patch
+
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
@@ -127,3 +129,39 @@ class TestRunMatchingJob(FrappeTestCase):
 		self.assertEqual(log.matching_status, "Completed")
 		matched_names = [row.reference_name for row in log.usage]
 		self.assertIn(invoice.name, matched_names)
+
+	def test_a_failure_is_caught_instead_of_leaving_the_job_unhandled(self):
+		# frappe.get_doc used to sit outside the try/except: any failure there (e.g. a
+		# race between insert and a worker picking the job up) crashed the RQ job
+		# unhandled, leaving matching_status stuck on "Pending" forever with no trace.
+		# It must now be caught and logged like any other failure in the job.
+		with patch("currency_audit.matching.frappe.log_error") as mock_log_error:
+			matching.run_matching_job("CEL-DOES-NOT-EXIST")
+
+		mock_log_error.assert_called_once()
+
+
+class TestRetryStuckMatches(FrappeTestCase):
+	"""Scheduled safety net: re-queues logs that have been Pending too long, covering
+	cases where the original enqueue was lost (e.g. no worker was running yet)."""
+
+	def test_requeues_old_pending_logs_but_not_fresh_ones(self):
+		currency_exchange = get_or_create_currency_exchange("USD", "ZAR", 19.0)
+
+		with patch("currency_audit.utils.frappe.enqueue"):
+			stuck_log = make_log(currency_exchange, new_rate=19.0, old_rate=18.5)
+			fresh_log = make_log(currency_exchange, new_rate=19.5, old_rate=19.0)
+
+		frappe.db.set_value(
+			"Currency Exchange Log",
+			stuck_log.name,
+			"creation",
+			frappe.utils.add_to_date(frappe.utils.now_datetime(), minutes=-30),
+		)
+
+		with patch("currency_audit.matching.frappe.enqueue") as mock_enqueue:
+			matching.retry_stuck_matches()
+
+		requeued_names = [call.kwargs["log_name"] for call in mock_enqueue.call_args_list]
+		self.assertIn(stuck_log.name, requeued_names)
+		self.assertNotIn(fresh_log.name, requeued_names)

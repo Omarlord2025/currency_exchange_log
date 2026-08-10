@@ -37,6 +37,13 @@ def create_log_entry(currency_exchange, new_rate, old_rate=None, entry_type="Cha
 		}
 	)
 	log.insert(ignore_permissions=True)
+	if not frappe.flags.in_test:
+		# Committed before enqueue so a worker that picks the job up immediately can
+		# always find the row — otherwise a fast worker can race the insert's own
+		# transaction and see the log as not-yet-existing. Skipped in tests: an
+		# explicit commit here would defeat FrappeTestCase's rollback-based
+		# isolation and leak fixtures into the real database permanently.
+		frappe.db.commit()
 
 	frappe.enqueue(
 		"currency_audit.matching.run_matching_job",

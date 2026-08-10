@@ -6,11 +6,19 @@ function across files).
 """
 
 import frappe
-from frappe.utils import now_datetime, nowdate
+from frappe.utils import now_datetime
+
+# Deliberately dated far in the future: guarantees a get_or_create lookup here can
+# only ever find a record this helper itself created, never a real site's actual
+# Currency Exchange data for the same currency pair. Without this, an app installed
+# on a live business site that happens to trade the same pair as a test (this once
+# collided with a shared "USD/INR" fixture) could have its real rate silently
+# overwritten by a test run.
+_TEST_FIXTURE_DATE = "2099-12-31"
 
 
 def get_or_create_currency_exchange(from_currency, to_currency, exchange_rate):
-	"""Return an existing Currency Exchange for the pair, updated to `exchange_rate`, or create one.
+	"""Return a test-only Currency Exchange for the pair, updated to `exchange_rate`, or create one.
 
 	Args:
 		from_currency (str): source currency code.
@@ -20,7 +28,10 @@ def get_or_create_currency_exchange(from_currency, to_currency, exchange_rate):
 	Returns:
 		Document: the Currency Exchange document.
 	"""
-	name = frappe.db.exists("Currency Exchange", {"from_currency": from_currency, "to_currency": to_currency})
+	name = frappe.db.exists(
+		"Currency Exchange",
+		{"from_currency": from_currency, "to_currency": to_currency, "date": _TEST_FIXTURE_DATE},
+	)
 	if name:
 		doc = frappe.get_doc("Currency Exchange", name)
 		if doc.exchange_rate != exchange_rate:
@@ -31,7 +42,7 @@ def get_or_create_currency_exchange(from_currency, to_currency, exchange_rate):
 	doc = frappe.get_doc(
 		{
 			"doctype": "Currency Exchange",
-			"date": nowdate(),
+			"date": _TEST_FIXTURE_DATE,
 			"from_currency": from_currency,
 			"to_currency": to_currency,
 			"exchange_rate": exchange_rate,

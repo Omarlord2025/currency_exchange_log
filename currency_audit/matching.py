@@ -11,7 +11,7 @@ against every transaction doctype that snapshots a conversion rate:
 """
 
 import frappe
-from frappe.utils import flt
+from frappe.utils import add_to_date, flt, now_datetime
 
 STANDARD_DOCTYPES = (
 	"Sales Invoice",
@@ -21,6 +21,10 @@ STANDARD_DOCTYPES = (
 	"Delivery Note",
 )
 
+# How long a log can sit on "Pending" before the scheduled sweep re-queues it.
+# Keeps a fast worker's in-flight job from being raced by the sweep itself.
+STUCK_THRESHOLD_MINUTES = 10
+
 
 def run_matching_job(log_name):
 	"""Match a Currency Exchange Log's old/new rate against transactions and save the results.
@@ -28,9 +32,8 @@ def run_matching_job(log_name):
 	Args:
 		log_name (str): name of the Currency Exchange Log document to match against.
 	"""
-	log = frappe.get_doc("Currency Exchange Log", log_name)
-
 	try:
+		log = frappe.get_doc("Currency Exchange Log", log_name)
 		rows = []
 		for rate_type, rate in (("Old Rate", log.old_rate), ("New Rate", log.new_rate)):
 			if not rate:
@@ -47,6 +50,24 @@ def run_matching_job(log_name):
 	except Exception:
 		frappe.log_error(title=f"Currency Exchange Log matching failed: {log_name}")
 		frappe.db.set_value("Currency Exchange Log", log_name, "matching_status", "Failed")
+
+
+def retry_stuck_matches():
+	"""Scheduled safety net: re-queue any log still "Pending" after STUCK_THRESHOLD_MINUTES.
+
+	The normal path is frappe.enqueue() right after the log is created (F1/F6). If no
+	worker was consuming the queue at that moment, or a worker restarted mid-job, the
+	job is lost with no trace and the entry would otherwise sit on "Pending" forever.
+	This sweep catches that and tries again.
+	"""
+	cutoff = add_to_date(now_datetime(), minutes=-STUCK_THRESHOLD_MINUTES)
+	stuck = frappe.get_all(
+		"Currency Exchange Log",
+		filters={"matching_status": "Pending", "creation": ["<", cutoff]},
+		pluck="name",
+	)
+	for log_name in stuck:
+		frappe.enqueue("currency_audit.matching.run_matching_job", queue="short", log_name=log_name)
 
 
 def _match_standard_doctype(doctype, currency, rate, rate_type):
