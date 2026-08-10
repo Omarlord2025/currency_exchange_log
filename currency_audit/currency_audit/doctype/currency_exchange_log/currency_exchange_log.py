@@ -27,7 +27,17 @@ class CurrencyExchangeLog(Document):
 	"""
 
 	def validate(self):
-		"""Block edits to core fields after insert; only usage/matching_status may still change."""
+		"""Block edits to core fields after insert; only usage/matching_status may still change.
+
+		One narrow, explicit exception: changed_by/changed_on on a Baseline entry may be
+		corrected by currency_audit.patches.correct_baseline_attribution, which sets
+		self.flags.allow_baseline_attribution_correction. That's a one-time data-quality
+		fix for entries mis-attributed by a bug in the original backfill logic (it used
+		to default to whoever ran the patch — always Administrator/CLI — instead of the
+		source Currency Exchange record's own modified_by/modified). Nothing else may set
+		this flag, and Change entries are never eligible: they're captured synchronously
+		during the real edit's own request, so they were never at risk of the same bug.
+		"""
 		if self.is_new():
 			return
 
@@ -35,7 +45,14 @@ class CurrencyExchangeLog(Document):
 		if not before:
 			return
 
+		correction_allowed = self.entry_type == "Baseline" and self.flags.get(
+			"allow_baseline_attribution_correction"
+		)
+		exempt_fields = {"changed_by", "changed_on"} if correction_allowed else set()
+
 		for fieldname in PROTECTED_FIELDS:
+			if fieldname in exempt_fields:
+				continue
 			if self.get(fieldname) != before.get(fieldname):
 				frappe.throw(
 					_("Currency Exchange Log entries are immutable; {0} cannot be changed.").format(fieldname)

@@ -8,6 +8,8 @@ and matching-job-enqueue logic lives here once instead of being duplicated.
 import frappe
 from frappe.utils import now_datetime
 
+from currency_audit.matching import matching_job_id
+
 
 def create_log_entry(currency_exchange, new_rate, old_rate=None, entry_type="Change", changed_by=None, changed_on=None):
 	"""Create an immutable Currency Exchange Log entry and enqueue the F4 matching job.
@@ -49,6 +51,8 @@ def create_log_entry(currency_exchange, new_rate, old_rate=None, entry_type="Cha
 		"currency_audit.matching.run_matching_job",
 		queue="short",
 		log_name=log.name,
+		job_id=matching_job_id(log.name),
+		deduplicate=True,
 	)
 
 	return log.name

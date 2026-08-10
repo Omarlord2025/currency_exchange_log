@@ -9,6 +9,7 @@ Note per PRD F4), plus the two doctypes with their own matching logic: Payment E
 from unittest.mock import patch
 
 import frappe
+from frappe.model.document import Document
 from frappe.tests.utils import FrappeTestCase
 
 from currency_audit import matching
@@ -19,6 +20,10 @@ from currency_audit.test_helpers import get_or_create_currency_exchange, make_lo
 # isn't installed on this site and aborts test collection entirely. The multi-currency
 # fixtures these tests need (_Test Customer USD, _Test Receivable/Bank USD - _TC, etc.)
 # are standard ERPNext test records already present on this site.
+
+# companies=[] disables the company/to_currency scoping (see TestCompanyScoping) so
+# these tests can focus purely on the currency+rate matching mechanics.
+NO_COMPANY_SCOPE = []
 
 
 class TestMatchStandardDoctype(FrappeTestCase):
@@ -39,7 +44,7 @@ class TestMatchStandardDoctype(FrappeTestCase):
 		)
 
 	def test_matches_submitted_invoice_by_currency_and_rate(self):
-		rows = matching._match_standard_doctype("Sales Invoice", "USD", self.rate, "New Rate")
+		rows = matching._match_standard_doctype("Sales Invoice", "USD", self.rate, "New Rate", NO_COMPANY_SCOPE)
 		names = [r["reference_name"] for r in rows]
 		self.assertIn(self.invoice.name, names)
 
@@ -50,7 +55,9 @@ class TestMatchStandardDoctype(FrappeTestCase):
 		self.assertEqual(row["rate_type"], "New Rate")
 
 	def test_does_not_match_a_different_rate(self):
-		rows = matching._match_standard_doctype("Sales Invoice", "USD", self.rate + 1, "New Rate")
+		rows = matching._match_standard_doctype(
+			"Sales Invoice", "USD", self.rate + 1, "New Rate", NO_COMPANY_SCOPE
+		)
 		names = [r["reference_name"] for r in rows]
 		self.assertNotIn(self.invoice.name, names)
 
@@ -79,7 +86,7 @@ class TestMatchPaymentEntry(FrappeTestCase):
 		cls.payment_entry = pe
 
 	def test_matches_on_source_side(self):
-		rows = matching._match_payment_entry("USD", self.rate, "Old Rate")
+		rows = matching._match_payment_entry("USD", self.rate, "Old Rate", NO_COMPANY_SCOPE)
 		names = [r["reference_name"] for r in rows]
 		self.assertIn(self.payment_entry.name, names)
 
@@ -101,9 +108,58 @@ class TestMatchJournalEntry(FrappeTestCase):
 		cls.journal_entry = jv
 
 	def test_matches_on_the_usd_row(self):
-		rows = matching._match_journal_entry("USD", self.rate, "New Rate")
+		rows = matching._match_journal_entry("USD", self.rate, "New Rate", NO_COMPANY_SCOPE)
 		names = [r["reference_name"] for r in rows]
 		self.assertIn(self.journal_entry.name, names)
+
+
+class TestCompanyScoping(FrappeTestCase):
+	"""Point C: a document's conversion_rate never states its to_currency — only which
+	company (and therefore base currency) it converts into. Without scoping by that,
+	a USD→EGP and a USD→INR log sharing a rate value both falsely claim any USD
+	document. _Test Company's base currency is INR, _Test Company 2's is EUR."""
+
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
+
+		cls.rate = 73.25
+		cls.invoice = create_sales_invoice(
+			company="_Test Company",
+			customer="_Test Customer USD",
+			debit_to="_Test Receivable USD - _TC",
+			currency="USD",
+			conversion_rate=cls.rate,
+		)
+
+	def test_matches_when_company_scope_includes_the_invoice_company(self):
+		rows = matching._match_standard_doctype("Sales Invoice", "USD", self.rate, "New Rate", ["_Test Company"])
+		self.assertIn(self.invoice.name, [r["reference_name"] for r in rows])
+
+	def test_does_not_match_when_company_scope_excludes_the_invoice_company(self):
+		# Same currency, same rate value — only the target currency (and therefore
+		# company) differs. This is exactly the false-positive Point C described.
+		rows = matching._match_standard_doctype(
+			"Sales Invoice", "USD", self.rate, "New Rate", ["_Test Company 2"]
+		)
+		self.assertNotIn(self.invoice.name, [r["reference_name"] for r in rows])
+
+	def test_empty_company_scope_falls_back_to_unrestricted(self):
+		# companies=[] means "couldn't determine any" (e.g. an unrecognised currency),
+		# not "match nothing" — the filter must be skipped, not applied as empty IN().
+		rows = matching._match_standard_doctype("Sales Invoice", "USD", self.rate, "New Rate", [])
+		self.assertIn(self.invoice.name, [r["reference_name"] for r in rows])
+
+
+class TestCompaniesWithCurrency(FrappeTestCase):
+	def test_returns_companies_matching_the_currency(self):
+		companies = matching._companies_with_currency("INR")
+		self.assertIn("_Test Company", companies)
+
+	def test_returns_empty_list_for_an_unused_currency(self):
+		companies = matching._companies_with_currency("XTS")
+		self.assertEqual(companies, [])
 
 
 class TestRunMatchingJob(FrappeTestCase):
@@ -120,6 +176,7 @@ class TestRunMatchingJob(FrappeTestCase):
 			currency="USD",
 			conversion_rate=rate,
 		)
+		# _Test Company's base currency is INR, matching this log's to_currency.
 		currency_exchange = get_or_create_currency_exchange("USD", "INR", rate)
 		log = make_log(currency_exchange, new_rate=rate, old_rate=rate - 1)
 
@@ -139,6 +196,48 @@ class TestRunMatchingJob(FrappeTestCase):
 			matching.run_matching_job("CEL-DOES-NOT-EXIST")
 
 		mock_log_error.assert_called_once()
+
+	def test_retries_on_a_save_conflict_then_succeeds(self):
+		# Reproduces the real production failure: two workers processing the same log
+		# concurrently (e.g. the retry sweep re-queuing a job that's still mid-save on
+		# a large real transaction table) — the loser's save() hits
+		# Document.check_if_latest()'s optimistic-lock check and raises
+		# TimestampMismatchError. The job must retry and recover, not just fail.
+		currency_exchange = get_or_create_currency_exchange("USD", "AUD", 1.55)
+		with patch("currency_audit.utils.frappe.enqueue"):
+			log = make_log(currency_exchange, new_rate=1.55, old_rate=1.5)
+
+		original_save = Document.save
+		failures_left = 2
+
+		def flaky_save(self, *args, **kwargs):
+			nonlocal failures_left
+			if self.doctype == "Currency Exchange Log" and failures_left > 0:
+				failures_left -= 1
+				raise frappe.TimestampMismatchError
+			return original_save(self, *args, **kwargs)
+
+		with patch("currency_audit.matching.time.sleep"), patch.object(Document, "save", flaky_save):
+			matching.run_matching_job(log.name)
+
+		log.reload()
+		self.assertEqual(log.matching_status, "Completed")
+		self.assertEqual(failures_left, 0)
+
+	def test_gives_up_and_marks_failed_after_max_attempts(self):
+		currency_exchange = get_or_create_currency_exchange("USD", "CAD", 1.35)
+		with patch("currency_audit.utils.frappe.enqueue"):
+			log = make_log(currency_exchange, new_rate=1.35, old_rate=1.3)
+
+		with (
+			patch("currency_audit.matching.time.sleep"),
+			patch.object(Document, "save", side_effect=frappe.TimestampMismatchError),
+			patch("currency_audit.matching.frappe.log_error") as mock_log_error,
+		):
+			matching.run_matching_job(log.name)
+
+		mock_log_error.assert_called_once()
+		self.assertEqual(frappe.db.get_value("Currency Exchange Log", log.name, "matching_status"), "Failed")
 
 
 class TestRetryStuckMatches(FrappeTestCase):
@@ -165,3 +264,21 @@ class TestRetryStuckMatches(FrappeTestCase):
 		requeued_names = [call.kwargs["log_name"] for call in mock_enqueue.call_args_list]
 		self.assertIn(stuck_log.name, requeued_names)
 		self.assertNotIn(fresh_log.name, requeued_names)
+
+	def test_requeue_is_deduplicated_by_job_id(self):
+		currency_exchange = get_or_create_currency_exchange("USD", "SGD", 1.4)
+		with patch("currency_audit.utils.frappe.enqueue"):
+			stuck_log = make_log(currency_exchange, new_rate=1.4, old_rate=1.35)
+		frappe.db.set_value(
+			"Currency Exchange Log",
+			stuck_log.name,
+			"creation",
+			frappe.utils.add_to_date(frappe.utils.now_datetime(), minutes=-30),
+		)
+
+		with patch("currency_audit.matching.frappe.enqueue") as mock_enqueue:
+			matching.retry_stuck_matches()
+
+		_, kwargs = mock_enqueue.call_args
+		self.assertEqual(kwargs.get("job_id"), matching.matching_job_id(stuck_log.name))
+		self.assertTrue(kwargs.get("deduplicate"))

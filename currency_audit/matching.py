@@ -10,6 +10,8 @@ against every transaction doctype that snapshots a conversion rate:
 - Journal Entry stores it per row of its `accounts` child table.
 """
 
+import time
+
 import frappe
 from frappe.utils import add_to_date, flt, now_datetime
 
@@ -25,31 +27,65 @@ STANDARD_DOCTYPES = (
 # Keeps a fast worker's in-flight job from being raced by the sweep itself.
 STUCK_THRESHOLD_MINUTES = 10
 
+# A log entry's matching job can legitimately take a while against a large real
+# transaction table — long enough to outlast STUCK_THRESHOLD_MINUTES. This retry
+# count covers the resulting Document.check_if_latest() conflict if the sweep
+# re-queues the same log while the original job is still mid-save.
+MAX_SAVE_ATTEMPTS = 3
+
+
+def matching_job_id(log_name):
+	"""Deterministic RQ job id for a log's matching job, used for deduplication.
+
+	Args:
+		log_name (str): name of the Currency Exchange Log document.
+
+	Returns:
+		str: job id to pass to frappe.enqueue(job_id=..., deduplicate=True).
+	"""
+	return f"currency-audit-match-{log_name}"
+
 
 def run_matching_job(log_name):
 	"""Match a Currency Exchange Log's old/new rate against transactions and save the results.
 
+	Retries on a save conflict (another worker saving the same log concurrently — see
+	matching_job_id's dedup, which prevents this at the source but isn't airtight, e.g.
+	if the sweep's dedup check itself races an in-flight enqueue) before giving up.
+
 	Args:
 		log_name (str): name of the Currency Exchange Log document to match against.
 	"""
-	try:
-		log = frappe.get_doc("Currency Exchange Log", log_name)
-		rows = []
-		for rate_type, rate in (("Old Rate", log.old_rate), ("New Rate", log.new_rate)):
-			if not rate:
-				continue
-			rate = flt(rate, 9)
-			for doctype in STANDARD_DOCTYPES:
-				rows += _match_standard_doctype(doctype, log.from_currency, rate, rate_type)
-			rows += _match_payment_entry(log.from_currency, rate, rate_type)
-			rows += _match_journal_entry(log.from_currency, rate, rate_type)
+	for attempt in range(1, MAX_SAVE_ATTEMPTS + 1):
+		try:
+			log = frappe.get_doc("Currency Exchange Log", log_name)
+			companies = _companies_with_currency(log.to_currency)
+			rows = []
+			for rate_type, rate in (("Old Rate", log.old_rate), ("New Rate", log.new_rate)):
+				if not rate:
+					continue
+				rate = flt(rate, 9)
+				for doctype in STANDARD_DOCTYPES:
+					rows += _match_standard_doctype(doctype, log.from_currency, rate, rate_type, companies)
+				rows += _match_payment_entry(log.from_currency, rate, rate_type, companies)
+				rows += _match_journal_entry(log.from_currency, rate, rate_type, companies)
 
-		log.set("usage", rows)
-		log.matching_status = "Completed"
-		log.save(ignore_permissions=True)
-	except Exception:
-		frappe.log_error(title=f"Currency Exchange Log matching failed: {log_name}")
-		frappe.db.set_value("Currency Exchange Log", log_name, "matching_status", "Failed")
+			log.set("usage", rows)
+			log.matching_status = "Completed"
+			log.save(ignore_permissions=True)
+			return
+		except frappe.TimestampMismatchError:
+			if attempt == MAX_SAVE_ATTEMPTS:
+				frappe.log_error(title=f"Currency Exchange Log matching failed: {log_name}")
+				frappe.db.set_value("Currency Exchange Log", log_name, "matching_status", "Failed")
+			else:
+				# Brief backoff so the concurrent save that caused the conflict has a
+				# chance to finish before this job re-reads and retries.
+				time.sleep(2 * attempt)
+		except Exception:
+			frappe.log_error(title=f"Currency Exchange Log matching failed: {log_name}")
+			frappe.db.set_value("Currency Exchange Log", log_name, "matching_status", "Failed")
+			return
 
 
 def retry_stuck_matches():
@@ -58,7 +94,8 @@ def retry_stuck_matches():
 	The normal path is frappe.enqueue() right after the log is created (F1/F6). If no
 	worker was consuming the queue at that moment, or a worker restarted mid-job, the
 	job is lost with no trace and the entry would otherwise sit on "Pending" forever.
-	This sweep catches that and tries again.
+	This sweep catches that and tries again — deduplicated by job id so it never queues
+	a second attempt on top of one that's still genuinely running.
 	"""
 	cutoff = add_to_date(now_datetime(), minutes=-STUCK_THRESHOLD_MINUTES)
 	stuck = frappe.get_all(
@@ -67,10 +104,42 @@ def retry_stuck_matches():
 		pluck="name",
 	)
 	for log_name in stuck:
-		frappe.enqueue("currency_audit.matching.run_matching_job", queue="short", log_name=log_name)
+		frappe.enqueue(
+			"currency_audit.matching.run_matching_job",
+			queue="short",
+			log_name=log_name,
+			job_id=matching_job_id(log_name),
+			deduplicate=True,
+		)
 
 
-def _match_standard_doctype(doctype, currency, rate, rate_type):
+def _companies_with_currency(currency):
+	"""Companies whose base currency is `currency` — narrows matches to the specific
+	pair a log entry is about, not just its from_currency (see Point C: without this,
+	a USD→EGP and a USD→INR log with the same numeric rate both falsely claim any USD
+	document, since a document's own conversion_rate never states its to_currency —
+	only which company, and therefore which base currency, it converts into).
+
+	Cached (companies rarely change) and empty on a cache miss means "couldn't
+	determine any" — callers must skip the company filter in that case rather than
+	excluding every document, since default_currency could plausibly not match any
+	company for less-common currencies without that being this job's problem to solve.
+
+	Args:
+		currency (str): the currency code to look up companies for.
+
+	Returns:
+		list[str]: company names whose default_currency equals `currency`.
+	"""
+	cache_key = f"currency_audit:companies_with_currency:{currency}"
+	companies = frappe.cache().get_value(cache_key)
+	if companies is None:
+		companies = frappe.get_all("Company", filters={"default_currency": currency}, pluck="name")
+		frappe.cache().set_value(cache_key, companies, expires_in_sec=3600)
+	return companies
+
+
+def _match_standard_doctype(doctype, currency, rate, rate_type, companies):
 	"""Match submitted documents of one of the five standard doctypes against a rate.
 
 	Args:
@@ -78,13 +147,21 @@ def _match_standard_doctype(doctype, currency, rate, rate_type):
 		currency (str): transaction currency to filter on.
 		rate (float): conversion_rate value to match exactly.
 		rate_type (str): "Old Rate" or "New Rate", recorded on each usage row.
+		companies (list[str]): companies whose base currency is the log's to_currency — a
+			conversion_rate only means what the log claims for a document belonging to one
+			of these. Empty means "couldn't determine any", so the filter is skipped rather
+			than excluding everything (see _companies_with_currency).
 
 	Returns:
 		list[dict]: usage child-table rows for matches found.
 	"""
+	filters = {"currency": currency, "conversion_rate": rate, "docstatus": 1}
+	if companies:
+		filters["company"] = ["in", companies]
+
 	matches = frappe.get_all(
 		doctype,
-		filters={"currency": currency, "conversion_rate": rate, "docstatus": 1},
+		filters=filters,
 		fields=["name", "posting_date", "grand_total", "currency"],
 	)
 	return [
@@ -100,26 +177,31 @@ def _match_standard_doctype(doctype, currency, rate, rate_type):
 	]
 
 
-def _match_payment_entry(currency, rate, rate_type):
+def _match_payment_entry(currency, rate, rate_type, companies):
 	"""Match submitted Payment Entries against a rate on either side of the transaction.
 
 	Args:
 		currency (str): account currency to filter on, checked against both the source and target side.
 		rate (float): source_exchange_rate / target_exchange_rate value to match exactly.
 		rate_type (str): "Old Rate" or "New Rate", recorded on each usage row.
+		companies (list[str]): see _match_standard_doctype; skipped if empty.
 
 	Returns:
 		list[dict]: usage child-table rows for matches found.
 	"""
 	rows = []
 
+	source_filters = {
+		"paid_from_account_currency": currency,
+		"source_exchange_rate": rate,
+		"docstatus": 1,
+	}
+	if companies:
+		source_filters["company"] = ["in", companies]
+
 	source_matches = frappe.get_all(
 		"Payment Entry",
-		filters={
-			"paid_from_account_currency": currency,
-			"source_exchange_rate": rate,
-			"docstatus": 1,
-		},
+		filters=source_filters,
 		fields=["name", "posting_date", "paid_amount", "paid_from_account_currency"],
 	)
 	rows += [
@@ -134,13 +216,17 @@ def _match_payment_entry(currency, rate, rate_type):
 		for m in source_matches
 	]
 
+	target_filters = {
+		"paid_to_account_currency": currency,
+		"target_exchange_rate": rate,
+		"docstatus": 1,
+	}
+	if companies:
+		target_filters["company"] = ["in", companies]
+
 	target_matches = frappe.get_all(
 		"Payment Entry",
-		filters={
-			"paid_to_account_currency": currency,
-			"target_exchange_rate": rate,
-			"docstatus": 1,
-		},
+		filters=target_filters,
 		fields=["name", "posting_date", "received_amount", "paid_to_account_currency"],
 	)
 	rows += [
@@ -158,13 +244,15 @@ def _match_payment_entry(currency, rate, rate_type):
 	return rows
 
 
-def _match_journal_entry(currency, rate, rate_type):
+def _match_journal_entry(currency, rate, rate_type, companies):
 	"""Match submitted Journal Entry rows (per-line rate/currency) against a rate.
 
 	Args:
 		currency (str): account currency to filter on within the `accounts` child table.
 		rate (float): per-row exchange_rate value to match exactly.
 		rate_type (str): "Old Rate" or "New Rate", recorded on each usage row.
+		companies (list[str]): see _match_standard_doctype; skipped if empty. Applied on
+			the parent Journal Entry, since company isn't a field on the child row itself.
 
 	Returns:
 		list[dict]: usage child-table rows for matches found.
@@ -183,16 +271,19 @@ def _match_journal_entry(currency, rate, rate_type):
 	if not matches:
 		return rows
 
-	posting_dates = dict(
-		frappe.get_all(
-			"Journal Entry",
-			filters={"name": ["in", list({m.parent for m in matches})]},
-			fields=["name", "posting_date"],
-			as_list=True,
-		)
-	)
+	parent_filters = {"name": ["in", list({m.parent for m in matches})]}
+	if companies:
+		parent_filters["company"] = ["in", companies]
+
+	posting_dates = {
+		p.name: p.posting_date
+		for p in frappe.get_all("Journal Entry", filters=parent_filters, fields=["name", "posting_date"])
+	}
 
 	for m in matches:
+		if m.parent not in posting_dates:
+			# Parent's company doesn't match the log's to_currency — not this log's match.
+			continue
 		rows.append(
 			{
 				"reference_doctype": "Journal Entry",

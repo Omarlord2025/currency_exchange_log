@@ -19,14 +19,15 @@ idempotent function, so running it twice is safe.
 import frappe
 
 INDEXED_FIELDS = (
-	("Sales Invoice", ["currency", "conversion_rate"]),
-	("Purchase Invoice", ["currency", "conversion_rate"]),
-	("POS Invoice", ["currency", "conversion_rate"]),
-	("Purchase Receipt", ["currency", "conversion_rate"]),
-	("Delivery Note", ["currency", "conversion_rate"]),
-	("Payment Entry", ["paid_from_account_currency", "source_exchange_rate"]),
-	("Payment Entry", ["paid_to_account_currency", "target_exchange_rate"]),
+	("Sales Invoice", ["currency", "conversion_rate", "company"]),
+	("Purchase Invoice", ["currency", "conversion_rate", "company"]),
+	("POS Invoice", ["currency", "conversion_rate", "company"]),
+	("Purchase Receipt", ["currency", "conversion_rate", "company"]),
+	("Delivery Note", ["currency", "conversion_rate", "company"]),
+	("Payment Entry", ["paid_from_account_currency", "source_exchange_rate", "company"]),
+	("Payment Entry", ["paid_to_account_currency", "target_exchange_rate", "company"]),
 	("Journal Entry Account", ["account_currency", "exchange_rate"]),
+	("Journal Entry", ["company"]),
 )
 
 

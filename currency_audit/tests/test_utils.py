@@ -33,6 +33,11 @@ class TestCreateLogEntry(FrappeTestCase):
 		_, kwargs = mock_enqueue.call_args
 		self.assertEqual(kwargs.get("log_name"), name)
 		self.assertEqual(kwargs.get("queue"), "short")
+		# Deduplicated by job id: without this, a job that's still running against a
+		# large real transaction table can be raced by a second enqueue for the same
+		# log (e.g. the retry sweep), causing a save conflict — see matching.py.
+		self.assertEqual(kwargs.get("job_id"), f"currency-audit-match-{name}")
+		self.assertTrue(kwargs.get("deduplicate"))
 
 	@patch("currency_audit.utils.frappe.enqueue")
 	def test_accepts_a_dict_like_source_for_baseline_backfill(self, mock_enqueue):
