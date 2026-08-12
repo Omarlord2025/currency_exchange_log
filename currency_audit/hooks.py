@@ -140,6 +140,27 @@ doc_events = {
 	"Currency Exchange": {
 		"on_update": "currency_audit.events.currency_exchange.on_update",
 	},
+	"Sales Invoice": {
+		"on_submit": "currency_audit.external_rate_detection.check_standard_doctype",
+	},
+	"Purchase Invoice": {
+		"on_submit": "currency_audit.external_rate_detection.check_standard_doctype",
+	},
+	"POS Invoice": {
+		"on_submit": "currency_audit.external_rate_detection.check_standard_doctype",
+	},
+	"Purchase Receipt": {
+		"on_submit": "currency_audit.external_rate_detection.check_standard_doctype",
+	},
+	"Delivery Note": {
+		"on_submit": "currency_audit.external_rate_detection.check_standard_doctype",
+	},
+	"Payment Entry": {
+		"on_submit": "currency_audit.external_rate_detection.check_payment_entry",
+	},
+	"Journal Entry": {
+		"on_submit": "currency_audit.external_rate_detection.check_journal_entry",
+	},
 }
 
 # Scheduled Tasks

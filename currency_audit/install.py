@@ -28,6 +28,9 @@ INDEXED_FIELDS = (
 	("Payment Entry", ["paid_to_account_currency", "target_exchange_rate", "company"]),
 	("Journal Entry Account", ["account_currency", "exchange_rate"]),
 	("Journal Entry", ["company"]),
+	# F1.6's _rate_already_recorded checks these on every relevant transaction submit.
+	("Currency Exchange Log", ["from_currency", "to_currency", "old_rate"]),
+	("Currency Exchange Log", ["from_currency", "to_currency", "new_rate"]),
 )
 
 
@@ -39,10 +42,12 @@ def after_install():
 	add_matching_indexes()
 
 	from currency_audit.patches.baseline_backfill import execute as run_baseline_backfill
+	from currency_audit.patches.detect_historical_external_rates import execute as detect_external_rates
 	from currency_audit.reconciliation import reconcile_version_history
 
 	run_baseline_backfill()
 	reconcile_version_history(since=None)
+	detect_external_rates()
 
 
 def add_matching_indexes():

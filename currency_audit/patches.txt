@@ -8,3 +8,4 @@ currency_audit.patches.baseline_backfill
 currency_audit.patches.correct_baseline_attribution
 currency_audit.patches.reconcile_historical_versions
 currency_audit.patches.recompute_matching_with_confidence
+currency_audit.patches.detect_historical_external_rates

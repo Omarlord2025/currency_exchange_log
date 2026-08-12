@@ -167,6 +167,13 @@ def _rate_windows(log):
 			(datetime | None, datetime | None) tuple — a window bound is None when
 			open-ended (no entry before/after this one for the same record).
 	"""
+	if not log.currency_exchange:
+		# External entries (F1.6) have no source Currency Exchange document to
+		# chain against — grouping by a blank currency_exchange would otherwise
+		# lump together unrelated External entries for entirely different currency
+		# pairs. No ordering basis exists for these, so leave both windows open.
+		return {"Old Rate": (None, None), "New Rate": (None, None)}
+
 	siblings = frappe.get_all(
 		"Currency Exchange Log",
 		filters={"currency_exchange": log.currency_exchange},

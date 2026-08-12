@@ -39,12 +39,13 @@ class TestMatchStandardDoctype(FrappeTestCase):
 		from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
 
 		cls.rate = 57.5
-		cls.invoice = create_sales_invoice(
-			customer="_Test Customer USD",
-			debit_to="_Test Receivable USD - _TC",
-			currency="USD",
-			conversion_rate=cls.rate,
-		)
+		with patch("currency_audit.utils.frappe.enqueue"):
+			cls.invoice = create_sales_invoice(
+				customer="_Test Customer USD",
+				debit_to="_Test Receivable USD - _TC",
+				currency="USD",
+				conversion_rate=cls.rate,
+			)
 
 	def test_matches_submitted_invoice_by_currency_and_rate(self):
 		rows = matching._match_standard_doctype(
@@ -75,19 +76,20 @@ class TestMatchPaymentEntry(FrappeTestCase):
 		from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
 
 		cls.rate = 61.25
-		invoice = create_sales_invoice(
-			customer="_Test Customer USD",
-			debit_to="_Test Receivable USD - _TC",
-			currency="USD",
-			conversion_rate=1,
-		)
-		pe = get_payment_entry("Sales Invoice", invoice.name, bank_account="_Test Bank USD - _TC")
-		pe.source_exchange_rate = cls.rate
-		pe.target_exchange_rate = cls.rate
-		pe.reference_no = "TEST-REF-0001"
-		pe.reference_date = frappe.utils.nowdate()
-		pe.insert(ignore_permissions=True)
-		pe.submit()
+		with patch("currency_audit.utils.frappe.enqueue"):
+			invoice = create_sales_invoice(
+				customer="_Test Customer USD",
+				debit_to="_Test Receivable USD - _TC",
+				currency="USD",
+				conversion_rate=1,
+			)
+			pe = get_payment_entry("Sales Invoice", invoice.name, bank_account="_Test Bank USD - _TC")
+			pe.source_exchange_rate = cls.rate
+			pe.target_exchange_rate = cls.rate
+			pe.reference_no = "TEST-REF-0001"
+			pe.reference_date = frappe.utils.nowdate()
+			pe.insert(ignore_permissions=True)
+			pe.submit()
 		cls.payment_entry = pe
 
 	def test_matches_on_source_side(self):
@@ -103,13 +105,15 @@ class TestMatchJournalEntry(FrappeTestCase):
 		from erpnext.accounts.doctype.journal_entry.test_journal_entry import make_journal_entry
 
 		cls.rate = 62.75
-		jv = make_journal_entry("_Test Bank USD - _TC", "_Test Cash - _TC", 100, exchange_rate=1, save=False)
-		jv.accounts[0].exchange_rate = cls.rate
-		# The contra leg is in company currency, so its company-currency amount must be
-		# rebalanced to match the USD leg's new company-currency equivalent (100 * rate).
-		jv.accounts[1].credit_in_account_currency = 100 * cls.rate
-		jv.insert()
-		jv.submit()
+		with patch("currency_audit.utils.frappe.enqueue"):
+			jv = make_journal_entry("_Test Bank USD - _TC", "_Test Cash - _TC", 100, exchange_rate=1, save=False)
+			jv.accounts[0].exchange_rate = cls.rate
+			# The contra leg is in company currency, so its company-currency amount
+			# must be rebalanced to match the USD leg's new company-currency
+			# equivalent (100 * rate).
+			jv.accounts[1].credit_in_account_currency = 100 * cls.rate
+			jv.insert()
+			jv.submit()
 		cls.journal_entry = jv
 
 	def test_matches_on_the_usd_row(self):
@@ -130,13 +134,14 @@ class TestCompanyScoping(FrappeTestCase):
 		from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
 
 		cls.rate = 73.25
-		cls.invoice = create_sales_invoice(
-			company="_Test Company",
-			customer="_Test Customer USD",
-			debit_to="_Test Receivable USD - _TC",
-			currency="USD",
-			conversion_rate=cls.rate,
-		)
+		with patch("currency_audit.utils.frappe.enqueue"):
+			cls.invoice = create_sales_invoice(
+				company="_Test Company",
+				customer="_Test Customer USD",
+				debit_to="_Test Receivable USD - _TC",
+				currency="USD",
+				conversion_rate=cls.rate,
+			)
 
 	def test_matches_when_company_scope_includes_the_invoice_company(self):
 		rows = matching._match_standard_doctype(
@@ -282,6 +287,18 @@ class TestRateWindows(FrappeTestCase):
 		windows = matching._rate_windows(log)
 		self.assertIsNone(windows["Old Rate"][0])
 
+	def test_external_entries_have_no_ordering_basis_and_stay_fully_open(self):
+		# External entries (F1.6) have no source Currency Exchange document, so
+		# there's no chronological chain to window against. Regression check: this
+		# must never group by a blank currency_exchange, which would otherwise lump
+		# together unrelated External entries for entirely different currency pairs.
+		fake_source = frappe._dict(name=None, from_currency="USD", to_currency="XOF")
+		with patch("currency_audit.utils.frappe.enqueue"):
+			log = make_log(fake_source, new_rate=605.5, old_rate=None, entry_type="External")
+
+		windows = matching._rate_windows(log)
+		self.assertEqual(windows, {"Old Rate": (None, None), "New Rate": (None, None)})
+
 
 class TestRunMatchingJobConfidence(FrappeTestCase):
 	"""End-to-end: the 50 -> 52 -> 50 -> 52 scenario, matched against real invoices."""
@@ -303,25 +320,25 @@ class TestRunMatchingJobConfidence(FrappeTestCase):
 			log_c = make_log(currency_exchange, old_rate=50.0, new_rate=52.0)
 			frappe.db.set_value("Currency Exchange Log", log_c.name, "changed_on", t3, update_modified=False)
 
-		# Genuinely used 52 during log_a's window (Jan) — should be Confirmed there.
-		clean_invoice = create_sales_invoice(
-			company="_Test Company",
-			customer="_Test Customer USD",
-			debit_to="_Test Receivable USD - _TC",
-			currency="USD",
-			conversion_rate=52.0,
-			posting_date="2024-01-15",
-		)
-		# Claims 52 but is dated inside log_b's window (Feb, when the rate was
-		# actually 50) — a genuine inconsistency, should be Possible under log_a.
-		odd_invoice = create_sales_invoice(
-			company="_Test Company",
-			customer="_Test Customer USD",
-			debit_to="_Test Receivable USD - _TC",
-			currency="USD",
-			conversion_rate=52.0,
-			posting_date="2024-02-15",
-		)
+			# Genuinely used 52 during log_a's window (Jan) — should be Confirmed there.
+			clean_invoice = create_sales_invoice(
+				company="_Test Company",
+				customer="_Test Customer USD",
+				debit_to="_Test Receivable USD - _TC",
+				currency="USD",
+				conversion_rate=52.0,
+				posting_date="2024-01-15",
+			)
+			# Claims 52 but is dated inside log_b's window (Feb, when the rate was
+			# actually 50) — a genuine inconsistency, should be Possible under log_a.
+			odd_invoice = create_sales_invoice(
+				company="_Test Company",
+				customer="_Test Customer USD",
+				debit_to="_Test Receivable USD - _TC",
+				currency="USD",
+				conversion_rate=52.0,
+				posting_date="2024-02-15",
+			)
 
 		matching.run_matching_job(log_a.name)
 		log_a.reload()
@@ -344,31 +361,31 @@ class TestRunMatchingJobConfidence(FrappeTestCase):
 				"Currency Exchange Log", log.name, "changed_on", change_instant, update_modified=False
 			)
 
-		before_invoice = create_sales_invoice(
-			company="_Test Company",
-			customer="_Test Customer USD",
-			debit_to="_Test Receivable USD - _TC",
-			currency="USD",
-			conversion_rate=3.64,
-			posting_date="2024-05-01",
-			do_not_submit=1,
-		)
-		before_invoice.posting_time = "10:00:00"
-		before_invoice.save()
-		before_invoice.submit()
+			before_invoice = create_sales_invoice(
+				company="_Test Company",
+				customer="_Test Customer USD",
+				debit_to="_Test Receivable USD - _TC",
+				currency="USD",
+				conversion_rate=3.64,
+				posting_date="2024-05-01",
+				do_not_submit=1,
+			)
+			before_invoice.posting_time = "10:00:00"
+			before_invoice.save()
+			before_invoice.submit()
 
-		after_invoice = create_sales_invoice(
-			company="_Test Company",
-			customer="_Test Customer USD",
-			debit_to="_Test Receivable USD - _TC",
-			currency="USD",
-			conversion_rate=3.64,
-			posting_date="2024-05-01",
-			do_not_submit=1,
-		)
-		after_invoice.posting_time = "18:00:00"
-		after_invoice.save()
-		after_invoice.submit()
+			after_invoice = create_sales_invoice(
+				company="_Test Company",
+				customer="_Test Customer USD",
+				debit_to="_Test Receivable USD - _TC",
+				currency="USD",
+				conversion_rate=3.64,
+				posting_date="2024-05-01",
+				do_not_submit=1,
+			)
+			after_invoice.posting_time = "18:00:00"
+			after_invoice.save()
+			after_invoice.submit()
 
 		matching.run_matching_job(log.name)
 		log.reload()
@@ -388,12 +405,13 @@ class TestRunMatchingJob(FrappeTestCase):
 		from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
 
 		rate = 48.0
-		invoice = create_sales_invoice(
-			customer="_Test Customer USD",
-			debit_to="_Test Receivable USD - _TC",
-			currency="USD",
-			conversion_rate=rate,
-		)
+		with patch("currency_audit.utils.frappe.enqueue"):
+			invoice = create_sales_invoice(
+				customer="_Test Customer USD",
+				debit_to="_Test Receivable USD - _TC",
+				currency="USD",
+				conversion_rate=rate,
+			)
 		# _Test Company's base currency is INR, matching this log's to_currency.
 		currency_exchange = get_or_create_currency_exchange("USD", "INR", rate)
 		log = make_log(currency_exchange, new_rate=rate, old_rate=rate - 1)
