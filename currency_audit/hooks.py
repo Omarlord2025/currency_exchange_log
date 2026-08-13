@@ -170,6 +170,7 @@ scheduler_events = {
 	"cron": {
 		"*/15 * * * *": ["currency_audit.matching.retry_stuck_matches"],
 		"0 3 * * *": ["currency_audit.reconciliation.reconcile_recent_version_history"],
+		"0 9 * * *": ["currency_audit.usd_egp_rate_fetcher.fetch_today"],
 	},
 }
 
