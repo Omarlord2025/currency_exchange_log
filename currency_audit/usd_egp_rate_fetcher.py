@@ -5,7 +5,7 @@ touches the real ERPNext Currency Exchange doctype and never changes what rate
 any transaction actually uses. Two entry points:
 
 - backfill_last_60_days(): one-time/on-demand, fetches the last 60 days in a
-  single API call (the provider's timeseries endpoint supports up to 365 days
+  single API call (the provider's timeframe endpoint supports up to 365 days
   per call, so this is one request, not sixty).
 - fetch_today(): the daily 9am scheduled job, fetches just today's rate.
 
@@ -15,11 +15,13 @@ deletion policy for now, rows are kept indefinitely.
 API shape (exchangerate.host, now part of apilayer, access_key query param):
 - GET {host}/live?access_key=...&source=USD&currencies=EGP
     -> {"quotes": {"USDEGP": <rate>}, ...}
-- GET {host}/timeseries?access_key=...&start_date=...&end_date=...&source=USD&currencies=EGP
-    -> exact shape unconfirmed against a real key at build time (documentation
-       was inconsistent between API versions) — _parse_timeseries_response tries
-       both plausible shapes and logs the raw response if neither matches, so
-       the first real run gives a concrete diagnostic instead of failing silently.
+- GET {host}/timeframe?access_key=...&start_date=...&end_date=...&source=USD&currencies=EGP
+    -> {"quotes": {"2024-01-01": {"USDEGP": <rate>}, ...}, ...}
+    Confirmed live against this provider's actual key: the endpoint is named
+    "timeframe", not "timeseries" — "timeseries" 404s with invalid_api_function.
+    _parse_timeseries_response still tries a legacy shape too and logs the raw
+    response if neither matches, so a future provider change gives a concrete
+    diagnostic instead of failing silently.
 """
 
 import frappe
@@ -147,7 +149,10 @@ def _fetch_live_rate(host, api_key):
 
 
 def _fetch_timeseries(host, api_key, start_date, end_date):
-	"""Call the /timeseries endpoint for a date range in a single request.
+	"""Call the /timeframe endpoint for a date range in a single request.
+
+	Note: this provider's date-range endpoint is named "timeframe", not the more
+	common "timeseries" — confirmed against a real key (the latter 404s).
 
 	Args:
 		host (str): API base URL.
@@ -159,7 +164,7 @@ def _fetch_timeseries(host, api_key, start_date, end_date):
 		tuple[dict, dict]: ({date_str: rate}, raw_response_json).
 	"""
 	response = requests.get(
-		f"{host.rstrip('/')}/timeseries",
+		f"{host.rstrip('/')}/timeframe",
 		params={
 			"access_key": api_key,
 			"start_date": start_date,
@@ -181,7 +186,7 @@ def _fetch_timeseries(host, api_key, start_date, end_date):
 
 
 def _parse_timeseries_response(data):
-	"""Extract {date: rate} from a /timeseries response, trying both documented
+	"""Extract {date: rate} from a /timeframe response, trying both documented
 	response shapes (they differ between provider API versions):
 
 	- apilayer/"live"-consistent: {"quotes": {"2024-01-01": {"USDEGP": 47.5}}}

@@ -133,6 +133,24 @@ class TestFetchLiveRate(FrappeTestCase):
 		mock_log_error.assert_called_once()
 
 
+class TestFetchTimeseries(FrappeTestCase):
+	def test_calls_the_timeframe_endpoint_not_timeseries(self):
+		"""Regression test: this provider's date-range endpoint is named
+		"timeframe" — "timeseries" is a plausible-looking but wrong guess that
+		404s with invalid_api_function against the real API."""
+		with patch("currency_audit.usd_egp_rate_fetcher.requests.get") as mock_get:
+			mock_get.return_value = _mock_response({"quotes": {"2024-01-01": {"USDEGP": 47.1}}})
+			rates, raw = fetcher._fetch_timeseries("https://api.example.com", "key123", "2024-01-01", "2024-01-01")
+
+		self.assertEqual(rates, {"2024-01-01": 47.1})
+
+		args, kwargs = mock_get.call_args
+		self.assertEqual(args[0], "https://api.example.com/timeframe")
+		self.assertEqual(kwargs["params"]["access_key"], "key123")
+		self.assertEqual(kwargs["params"]["start_date"], "2024-01-01")
+		self.assertEqual(kwargs["params"]["end_date"], "2024-01-01")
+
+
 class TestFetchToday(FrappeTestCase):
 	def test_stores_todays_rate_when_configured(self):
 		_configure_settings()
