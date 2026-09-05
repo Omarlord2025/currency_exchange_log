@@ -218,7 +218,36 @@ scheduler_events = {
 # Ignore links to specified DocTypes when deleting documents
 # -----------------------------------------------------------
 
-# ignore_links_on_delete = ["Communication", "ToDo"]
+# PRD Principle 5 ("audit-only, not enforcement"): this app records what happened and
+# must never stop anyone from cancelling or deleting a transaction. Without this hook
+# it does exactly that — the `usage` child table points at every matched transaction
+# with a Dynamic Link (reference_doctype + reference_name), which is enough for
+# Frappe's link checker to treat a matched Journal Entry / Sales Invoice / Payment
+# Entry / etc. as "still linked" and refuse the operation:
+#
+#     Cannot delete or cancel because Journal Entry ACC-JV-2026-00747 is linked
+#     with Currency Exchange Log CEL-00032 at Row: 1
+#
+# Both names are listed, and between them they cover both operations
+# (see frappe.model.delete_doc):
+#
+# - "Currency Exchange Log Usage" is the `df.parent` of the Dynamic Link field, so
+#   get_dynamic_linked_docs skips it up front, before it even runs the lookup query.
+# - "Currency Exchange Log" is the `reference_doctype` that same function reports for
+#   a child row (the row's parenttype), checked again after the query — and it's also
+#   what the *static* link path (get_linked_docs) matches on, which is what keeps the
+#   log's own `currency_exchange` Link field from blocking deletion of a Currency
+#   Exchange record.
+#
+# Cancel is covered as well as delete: for dynamic links this hook is deliberately not
+# gated on the method, unlike the static path where it applies to Delete only. That
+# asymmetry is fine here — the log has no static Link to any transaction doctype, only
+# the dynamic one, so there is nothing left for Cancel to trip over.
+#
+# A usage row left pointing at a since-deleted document is intentionally not cleaned
+# up: the log is an immutable record of what matched at the time (Principle 1), and
+# the next matching run for that log rebuilds `usage` wholesale anyway.
+ignore_links_on_delete = ["Currency Exchange Log", "Currency Exchange Log Usage"]
 
 # Request Events
 # ----------------
