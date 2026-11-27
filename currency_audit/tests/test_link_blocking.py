@@ -83,6 +83,9 @@ def add_usage_row(log, doc, currency, amount):
 			"match_confidence": "Confirmed",
 		},
 	)
+	# Same flag the matching job sets — `usage` is otherwise rejected as a hand-edit
+	# (see CurrencyExchangeLog._reject_matching_result_edits).
+	log.flags.allow_matching_update = True
 	log.save(ignore_permissions=True)
 
 	# get_dynamic_link_map only lists a doctype the child table has actually been seen

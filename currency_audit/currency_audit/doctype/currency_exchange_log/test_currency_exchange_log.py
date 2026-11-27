@@ -49,6 +49,9 @@ class TestCurrencyExchangeLog(FrappeTestCase):
 				"rate_type": "New Rate",
 			},
 		)
+		# Same flag the matching job sets — otherwise these two fields are rejected as
+		# hand-edits (see CurrencyExchangeLog._reject_matching_result_edits).
+		log.flags.allow_matching_update = True
 		log.save(ignore_permissions=True)
 		log.reload()
 		self.assertEqual(log.matching_status, "Completed")

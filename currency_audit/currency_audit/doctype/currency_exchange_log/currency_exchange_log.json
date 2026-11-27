@@ -132,7 +132,8 @@
    "fieldname": "usage",
    "fieldtype": "Table",
    "label": "Matched Transactions",
-   "options": "Currency Exchange Log Usage"
+   "options": "Currency Exchange Log Usage",
+   "read_only": 1
   },
   {
    "description": "Set only for Recovered entries: the Frappe Version record this entry was reconstructed from. Open it to see Frappe's own rendered diff.",

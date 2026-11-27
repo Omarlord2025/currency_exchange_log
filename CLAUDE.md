@@ -67,9 +67,13 @@ searching for transactions whose stored rate equals the log's `old_rate` or `new
   (`Confirmed`/`Possible`) label via `_rate_windows()`/`_confidence()`. An ambiguous match is still
   shown, just flagged.
 - **Logs are immutable.** `CurrencyExchangeLog.validate` rejects changes to any field in
-  `PROTECTED_FIELDS` and `on_trash` rejects deletion outright. Only `usage` and `matching_status`
-  may change after insert. The one exemption is gated on the
-  `allow_baseline_attribution_correction` flag, set solely by `patches/correct_baseline_attribution.py`.
+  `PROTECTED_FIELDS` and `on_trash` rejects deletion outright. `usage` and `matching_status` may
+  change after insert, but only through `run_matching_job`, which sets `flags.allow_matching_update`
+  before saving — any other write (Administrator, REST API, console) is rejected by
+  `_reject_matching_result_edits`, and `CurrencyExchangeLogUsage.on_trash` blocks deleting a single row.
+  Tests that write `usage` by hand must set the same flag; note `reload()` does not clear flags.
+  The other exemption is gated on the `allow_baseline_attribution_correction` flag, set solely by
+  `patches/correct_baseline_attribution.py`.
 - **A transaction never states its `to_currency`** — only its company, and therefore that company's
   base currency. `_companies_with_currency()` scopes matches by that; without it a USD→EGP and a
   USD→INR log with the same numeric rate would both claim the same documents. An empty company list

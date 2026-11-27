@@ -75,6 +75,9 @@ def run_matching_job(log_name):
 
 			log.set("usage", rows)
 			log.matching_status = "Completed"
+			# This job is the only writer the log's immutability check will accept for
+			# `usage` and `matching_status` (see CurrencyExchangeLog._reject_matching_result_edits).
+			log.flags.allow_matching_update = True
 			log.save(ignore_permissions=True)
 			return
 		except frappe.TimestampMismatchError:
