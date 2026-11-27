@@ -3,6 +3,7 @@
 
 import frappe
 from frappe import _
+from frappe.core.doctype.version.version import get_diff
 from frappe.model.document import Document
 
 PROTECTED_FIELDS = (
@@ -58,6 +59,46 @@ class CurrencyExchangeLog(Document):
 				frappe.throw(
 					_("Currency Exchange Log entries are immutable; {0} cannot be changed.").format(fieldname)
 				)
+
+		if not self.flags.get("allow_matching_update"):
+			self._reject_matching_result_edits(before)
+
+	def _reject_matching_result_edits(self, before):
+		"""Block hand-edits to the matched-transactions table and its status.
+
+		The `usage` grid is the evidence half of the audit trail, so it has to be as
+		untouchable as the rates themselves — and "untouchable" has to mean everyone.
+		No role holds write on this doctype, so Desk was already closed to normal users;
+		what this closes is Administrator (which bypasses role permissions outright), the
+		REST API, and bench console.
+
+		The only legitimate writer is currency_audit.matching.run_matching_job, which
+		announces itself by setting self.flags.allow_matching_update before saving.
+		Deleting a single row on its own is blocked separately, on the child doctype's
+		own on_trash: that path never loads the parent, so it can't be caught here.
+
+		Args:
+			before (Document): this log as it was immediately before the current save.
+		"""
+		if self.matching_status != before.matching_status:
+			frappe.throw(
+				_("Matching Status is set by the background matching job and cannot be changed by hand.")
+			)
+
+		# get_diff is Frappe's own child-table differ — the one behind Version history —
+		# so added, removed and in-place-edited rows are all caught using the framework's
+		# type normalisation instead of a hand-rolled comparison that would trip over a
+		# date or float arriving from the client in a different shape than it left the DB.
+		# It is purely in-memory: no extra queries on a save.
+		diff = get_diff(before, self)
+		if diff and any(
+			entry[0] == "usage"
+			for key in ("added", "removed", "row_changed")
+			for entry in diff.get(key) or []
+		):
+			frappe.throw(
+				_("Matched Transactions are maintained by the background matching job and cannot be edited.")
+			)
 
 	def on_trash(self):
 		"""Reject deletion outright; the log is a permanent audit trail (Principle 1)."""
