@@ -6,7 +6,7 @@ from frappe.model.document import Document
 
 class USDCNYExchangeRate(Document):
 	"""One row per day's USD->CNY market rate, fetched from an external API
-	(currency_audit.usd_cny_rate_fetcher). Created via the 60-day backfill or the
-	daily 9am job; one row per calendar date, enforced at the application level
-	(see usd_cny_rate_fetcher.store_rate) since Frappe doesn't support a unique
-	constraint on a Date field. No deletion policy for now — kept indefinitely."""
+	(currency_audit.market_rate_fetcher). Created via the 60-day backfill or the
+	daily 9am job; one row per calendar date, enforced by the
+	deterministic autoname (USD-CNY-<date>), so a concurrent duplicate insert hits
+	the primary key (see market_rate_fetcher.store_rate). No deletion policy for now — kept indefinitely."""

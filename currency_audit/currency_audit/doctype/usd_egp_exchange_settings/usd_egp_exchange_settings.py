@@ -5,7 +5,7 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 
-# Path segments the fetcher appends itself (see usd_egp_rate_fetcher.py). If a
+# Path segments the fetcher appends itself (see market_rate_fetcher.py). If a
 # user pastes a full endpoint URL into `host` instead of the bare host — an easy
 # mistake, since ERPNext's own built-in "Currency Exchange Settings" doctype has
 # a similarly-named field that *does* want a full endpoint URL — the fetcher
@@ -14,8 +14,9 @@ _KNOWN_ENDPOINT_SEGMENTS = ("live", "timeframe", "timeseries", "convert", "histo
 
 
 class USDEGPExchangeSettings(Document):
-	"""Single doctype holding the external rate API's host and key
-	(currency_audit.usd_egp_rate_fetcher reads this). api_key is a Password field,
+	"""Single doctype holding the external rate API's host and key, shared by the
+	USD->EGP and USD->CNY fetchers
+	(currency_audit.market_rate_fetcher reads this). api_key is a Password field,
 	encrypted at rest by Frappe."""
 
 	def validate(self):

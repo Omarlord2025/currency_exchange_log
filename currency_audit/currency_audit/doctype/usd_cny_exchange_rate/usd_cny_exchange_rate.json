@@ -1,7 +1,7 @@
 {
  "actions": [],
  "allow_rename": 1,
- "autoname": "USD-CNY-.#####",
+ "autoname": "format:USD-CNY-{date}",
  "creation": "2026-08-13 03:14:58.459375",
  "doctype": "DocType",
  "editable_grid": 1,
