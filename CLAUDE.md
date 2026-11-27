@@ -126,6 +126,9 @@ It **never touches Currency Exchange** and is not part of the audit pipeline. Th
 endpoint is `/timeframe`, not `/timeseries` (the latter 404s), and `host` must be a bare base URL —
 `USDEGPExchangeSettings.validate` enforces that.
 
+`usd_cny_rate_fetcher.py` + `USD CNY Exchange Rate` + `USD CNY Exchange Settings` are the same feature for
+USD→CNY (RMB), as a deliberate copy with its own settings/key. Keep the two in step when changing either.
+
 ### Tests
 
 `FrappeTestCase` (`frappe.tests.utils`), rollback-isolated — which is why `create_log_entry` and
