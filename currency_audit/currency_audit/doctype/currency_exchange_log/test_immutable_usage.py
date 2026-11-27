@@ -75,6 +75,9 @@ class TestUsageTableIsImmutable(FrappeTestCase):
 		log.flags.allow_matching_update = True
 		log.save(ignore_permissions=True)
 		log.reload()
+		# reload() leaves `flags` alone, so without this the returned doc would still carry
+		# the matching job's bypass and every "cannot edit" test below would save through it.
+		log.flags.allow_matching_update = False
 		return log
 
 	def test_running_as_administrator(self):

@@ -234,6 +234,13 @@ class TestRetryIfMissing(FrappeTestCase):
 
 
 class TestBackfillLast60Days(FrappeTestCase):
+	def setUp(self):
+		# FrappeTestCase only rolls back per class, and every test here writes the same
+		# fixed 2024-07-01/02 rows — so without this a test that runs earlier leaves rows
+		# behind and a later "stores every day" test sees them as already recorded.
+		frappe.db.savepoint("backfill_test")
+		self.addCleanup(frappe.db.rollback, save_point="backfill_test")
+
 	def _series(self):
 		return (
 			{
