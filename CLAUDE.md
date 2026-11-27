@@ -120,11 +120,16 @@ back to midnight for them — day-level confidence is the ceiling there, not a b
 
 ### Separate, self-contained feature
 
-`usd_egp_rate_fetcher.py` + `USD EGP Exchange Rate` + `USD EGP Exchange Settings` are a standalone
-reference table of daily USD→EGP market rates (9am scheduled job, plus an on-demand 60-day backfill).
-It **never touches Currency Exchange** and is not part of the audit pipeline. The provider's date-range
-endpoint is `/timeframe`, not `/timeseries` (the latter 404s), and `host` must be a bare base URL —
-`USDEGPExchangeSettings.validate` enforces that.
+`market_rate_fetcher.py` + `USD EGP Exchange Rate` + `USD CNY Exchange Rate` + the shared
+`USD EGP Exchange Settings` (name predates CNY; it holds the one host + key for both) are a standalone
+reference table of daily USD→EGP and USD→CNY (RMB) market rates. Both currencies come from a single
+`/live` (9am job) or `/timeframe` (on-demand 60-day backfill) request, because the provider's free plan
+is ~100 requests/month. `retry_if_missing` (9:15) re-calls the API only if a currency has no row today.
+To add a currency: a new rate doctype plus one entry in `RATE_DOCTYPES`. It **never touches Currency
+Exchange** and is not part of the audit pipeline. The provider's date-range endpoint is `/timeframe`, not
+`/timeseries` (the latter 404s), errors arrive as `{"success": false}` bodies (code 104 = quota used up),
+and `host` must be a bare base URL — `USDEGPExchangeSettings.validate` enforces that. One row per date is
+enforced by the rate doctypes' `format:USD-<CUR>-{date}` autoname.
 
 ### Tests
 
